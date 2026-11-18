@@ -10,6 +10,19 @@ authors = ["Lexo Liu <me@lexo.cool>"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/May-Agent/claude-acp"
 
+[workspace.dependencies]
+async-channel = { version = "2.5", default-features = false, features = ["std"] }
+async-fs = { version = "2.2", default-features = false }
+async-process = { version = "2.5", default-features = false }
+chrono = { version = "0.4.45", default-features = false, features = ["std"] }
+claude-codes = { version = "2.1.327", default-features = false, features = ["types"] }
+futures-lite = { version = "2.6", default-features = false, features = ["std"] }
+serde = { version = "1.0", default-features = false, features = ["std", "derive"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+thiserror = { version = "2.0", default-features = false, features = ["std"] }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+uuid = { version = "1", default-features = false, features = ["std", "v4", "serde"] }
+
 [workspace.lints]
 rust.missing_docs = "warn"
 rust.missing_debug_implementations = "warn"

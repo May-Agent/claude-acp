@@ -9,5 +9,25 @@ repository.workspace = true
 description = "Runtime-agnostic SDK for the Claude Code stream-json control protocol"
 publish = false
 
+[features]
+default = ["process"]
+process = ["dep:async-process"]
+
+[dependencies]
+async-channel.workspace = true
+async-fs.workspace = true
+async-process = { workspace = true, optional = true }
+chrono.workspace = true
+claude-codes.workspace = true
+futures-lite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "time"] }
+
 [lints]
 workspace = true
