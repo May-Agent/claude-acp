@@ -434,15 +434,22 @@ impl Client {
             )
             .await;
 
-            state.outbound_rx.close();
             if let Some(err) = outcome.error {
                 let _ = state.terminal_error.set(err.clone());
-                fail_pending(outcome.pending, &state.outbound_rx, &err);
+                state.outbound_rx.close();
+                fail_pending(
+                    outcome.pending,
+                    outcome.pending_acks,
+                    &state.outbound_rx,
+                    &err,
+                );
                 state.events_tx.close();
                 Err(err)
             } else {
+                state.outbound_rx.close();
                 fail_pending(
                     outcome.pending,
+                    outcome.pending_acks,
                     &state.outbound_rx,
                     &SdkError::ChannelClosed,
                 );
@@ -546,15 +553,22 @@ impl Client {
                 (None, _) => None,
             };
 
-            state.outbound_rx.close();
             if let Some(err) = final_error {
                 let _ = state.terminal_error.set(err.clone());
-                fail_pending(outcome.pending, &state.outbound_rx, &err);
+                state.outbound_rx.close();
+                fail_pending(
+                    outcome.pending,
+                    outcome.pending_acks,
+                    &state.outbound_rx,
+                    &err,
+                );
                 state.events_tx.close();
                 Err(err)
             } else {
+                state.outbound_rx.close();
                 fail_pending(
                     outcome.pending,
+                    outcome.pending_acks,
                     &state.outbound_rx,
                     &SdkError::ChannelClosed,
                 );
@@ -923,6 +937,7 @@ struct DriverChannels {
 
 struct DriveOutcome {
     pending: HashMap<String, Sender<Result<Option<Value>>>>,
+    pending_acks: Vec<Sender<Result<()>>>,
     error: Option<SdkError>,
     #[cfg_attr(not(feature = "process"), allow(dead_code))]
     error_is_protocol: bool,
@@ -933,10 +948,12 @@ struct DriveOutcome {
 impl DriveOutcome {
     const fn ok(
         pending: HashMap<String, Sender<Result<Option<Value>>>>,
+        pending_acks: Vec<Sender<Result<()>>>,
         client_closed: bool,
     ) -> Self {
         Self {
             pending,
+            pending_acks,
             error: None,
             error_is_protocol: false,
             client_closed,
@@ -945,11 +962,13 @@ impl DriveOutcome {
 
     const fn err(
         pending: HashMap<String, Sender<Result<Option<Value>>>>,
+        pending_acks: Vec<Sender<Result<()>>>,
         error: SdkError,
         error_is_protocol: bool,
     ) -> Self {
         Self {
             pending,
+            pending_acks,
             error: Some(error),
             error_is_protocol,
             client_closed: false,
@@ -1010,6 +1029,7 @@ where
     H: ControlHandler,
 {
     let mut pending: HashMap<String, Sender<Result<Option<Value>>>> = HashMap::new();
+    let mut pending_acks: Vec<Sender<Result<()>>> = Vec::new();
     let mut in_flight: Vec<InFlightTask> = Vec::new();
     let mut outbound_closed = false;
     let mut stdin_closed = false;
@@ -1032,7 +1052,9 @@ where
         match step {
             Step::HandlerReply(response_msg) => {
                 if let Err(err) = writer.send_json(&response_msg).await {
-                    return DriveOutcome::err(pending, err, false);
+                    let is_protocol = matches!(err, SdkError::Protocol(_) | SdkError::Json { .. });
+                    let _ = writer.close().await;
+                    return DriveOutcome::err(pending, pending_acks, err, is_protocol);
                 }
             }
             Step::Outbound(Ok(Outbound::ControlRequest {
@@ -1045,29 +1067,33 @@ where
                     request_id: &request_id,
                     request: &request,
                 };
-                if let Err(err) = writer.send_json(&envelope).await {
-                    let _ = reply.try_send(Err(err.clone()));
-                    return DriveOutcome::err(pending, err, false);
-                }
+                let send_res = writer.send_json(&envelope).await;
                 pending.insert(request_id, reply);
+                if let Err(err) = send_res {
+                    let is_protocol = matches!(err, SdkError::Protocol(_) | SdkError::Json { .. });
+                    let _ = writer.close().await;
+                    return DriveOutcome::err(pending, pending_acks, err, is_protocol);
+                }
             }
             Step::Outbound(Ok(Outbound::Input { input, ack })) => {
                 if let Err(err) = writer.send_json(&input).await {
-                    let _ = ack.try_send(Err(err.clone()));
-                    return DriveOutcome::err(pending, err, false);
+                    let is_protocol = matches!(err, SdkError::Protocol(_) | SdkError::Json { .. });
+                    pending_acks.push(ack);
+                    let _ = writer.close().await;
+                    return DriveOutcome::err(pending, pending_acks, err, is_protocol);
                 }
                 let _ = ack.try_send(Ok(()));
             }
             Step::Outbound(Ok(Outbound::Close)) => {
                 let _ = writer.close().await;
-                return DriveOutcome::ok(pending, true);
+                return DriveOutcome::ok(pending, pending_acks, true);
             }
             Step::Outbound(Err(_)) => {
                 outbound_closed = true;
             }
             Step::Inbound(Ok(None)) => {
                 let _ = writer.close().await;
-                return DriveOutcome::ok(pending, false);
+                return DriveOutcome::ok(pending, pending_acks, false);
             }
             Step::Inbound(Ok(Some(output))) => {
                 handle_inbound_output(*output, &handler, &mut pending, &mut in_flight, events_tx);
@@ -1075,7 +1101,7 @@ where
             Step::Inbound(Err(err)) => {
                 let is_protocol = matches!(err, SdkError::Protocol(_) | SdkError::Json { .. });
                 let _ = writer.close().await;
-                return DriveOutcome::err(pending, err, is_protocol);
+                return DriveOutcome::err(pending, pending_acks, err, is_protocol);
             }
         }
     }
@@ -1174,11 +1200,15 @@ async fn dispatch_inbound_control<H: ControlHandler>(
 
 fn fail_pending(
     pending: HashMap<String, Sender<Result<Option<Value>>>>,
+    pending_acks: Vec<Sender<Result<()>>>,
     outbound_rx: &Receiver<Outbound>,
     err: &SdkError,
 ) {
     for (_, waiter) in pending {
         let _ = waiter.try_send(Err(err.clone()));
+    }
+    for ack in pending_acks {
+        let _ = ack.try_send(Err(err.clone()));
     }
     while let Ok(item) = outbound_rx.try_recv() {
         match item {
@@ -1216,14 +1246,26 @@ where
     .await
     {
         FirstDone::Io(outcome) => {
-            if outcome.client_closed || outcome.error.is_some() {
+            if outcome.client_closed {
                 let _ = child.kill();
+                return (outcome, String::new());
             }
+            if outcome.error.is_some() {
+                let _ = child.kill();
+                if outcome.error_is_protocol {
+                    return (outcome, String::new());
+                }
+            }
+            drop(io_pinned);
             let stderr_tail = stderr_pinned.await;
             (outcome, stderr_tail)
         }
         FirstDone::Stderr(stderr_tail) => {
+            drop(stderr_pinned);
             let outcome = io_pinned.await;
+            if outcome.client_closed || outcome.error.is_some() {
+                let _ = child.kill();
+            }
             (outcome, stderr_tail)
         }
     }

@@ -771,6 +771,17 @@ async fn unexpected_eof_fails_all_pending_control_requests_immediately() {
 }
 
 #[cfg(feature = "process")]
+fn assert_process_exited_with_stderr(err: &SdkError) {
+    match err {
+        SdkError::ProcessExited { status, stderr } => {
+            assert!(status.is_some_and(|s| !s.success()));
+            assert!(!stderr.trim().is_empty(), "expected non-empty stderr");
+        }
+        other => panic!("expected ProcessExited, got {other:?}"),
+    }
+}
+
+#[cfg(feature = "process")]
 #[tokio::test]
 async fn child_process_nonzero_exit_propagates_status_and_stderr_to_pending_callers() {
     use claude_acp_sdk::SessionConfig;
@@ -782,50 +793,174 @@ async fn child_process_nonzero_exit_propagates_status_and_stderr_to_pending_call
     let driver_task = tokio::spawn(driver);
 
     let init_err = client.initialize().await.unwrap_err();
-    match &init_err {
-        SdkError::ProcessExited { status, stderr } => {
-            assert!(status.is_some_and(|s| !s.success()));
-            assert!(!stderr.trim().is_empty(), "expected non-empty stderr");
-        }
-        other => panic!("expected ProcessExited, got {other:?}"),
-    }
+    assert_process_exited_with_stderr(&init_err);
 
     let event_err = client.next_event().await.unwrap_err();
-    assert!(matches!(event_err, SdkError::ProcessExited { .. }));
+    assert_process_exited_with_stderr(&event_err);
 
     let driver_err = driver_task.await.unwrap().unwrap_err();
-    assert!(matches!(driver_err, SdkError::ProcessExited { .. }));
+    assert_process_exited_with_stderr(&driver_err);
+}
+
+#[cfg(feature = "process")]
+#[tokio::test]
+async fn child_process_broken_pipe_write_still_reports_process_exited() {
+    use std::time::Duration;
+
+    use claude_acp_sdk::SessionConfig;
+
+    // Case 1: outbound `control_request` write hits `BrokenPipe` after `/bin/sh` exits.
+    let (client, driver) = Client::spawn(
+        SessionConfig::new().claude_path("/bin/sh"),
+        NoopControlHandler,
+    )
+    .unwrap();
+    let c_init = client.clone();
+    let init_task = tokio::spawn(async move { c_init.initialize().await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let driver_task = tokio::spawn(driver);
+
+    let init_err = init_task.await.unwrap().unwrap_err();
+    assert_process_exited_with_stderr(&init_err);
+    let driver_err = driver_task.await.unwrap().unwrap_err();
+    assert_process_exited_with_stderr(&driver_err);
+
+    // Case 2: outbound `ClaudeInput` write hits `BrokenPipe` after `/bin/sh` exits.
+    let (client_in, driver_in) = Client::spawn(
+        SessionConfig::new().claude_path("/bin/sh"),
+        NoopControlHandler,
+    )
+    .unwrap();
+    let c_msg = client_in.clone();
+    let msg_task = tokio::spawn(async move { c_msg.send_user_message("ping").await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let driver_in_task = tokio::spawn(driver_in);
+
+    let msg_err = msg_task.await.unwrap().unwrap_err();
+    assert_process_exited_with_stderr(&msg_err);
+    let driver_in_err = driver_in_task.await.unwrap().unwrap_err();
+    assert_process_exited_with_stderr(&driver_in_err);
+}
+
+#[cfg(all(feature = "process", unix))]
+struct ScriptSandbox {
+    dir: std::path::PathBuf,
+    grandchild_pid_file: std::path::PathBuf,
+}
+
+#[cfg(all(feature = "process", unix))]
+impl ScriptSandbox {
+    fn new() -> Self {
+        let dir =
+            std::env::temp_dir().join(format!("claude-acp-sdk-close-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let grandchild_pid_file = dir.join("grandchild.pid");
+        Self {
+            dir,
+            grandchild_pid_file,
+        }
+    }
+
+    fn write_executable(&self, name: &str, contents: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = self.dir.join(name);
+        std::fs::write(&path, contents).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+}
+
+#[cfg(all(feature = "process", unix))]
+impl Drop for ScriptSandbox {
+    fn drop(&mut self) {
+        if let Ok(raw_pid) = std::fs::read_to_string(&self.grandchild_pid_file) {
+            let pid = raw_pid.trim();
+            if !pid.is_empty() && pid.chars().all(|ch| ch.is_ascii_digit()) {
+                let _ = std::process::Command::new("kill")
+                    .args(["-9", pid])
+                    .status();
+            }
+        }
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
 }
 
 #[cfg(all(feature = "process", unix))]
 #[tokio::test]
 async fn client_close_on_spawned_child_resolves_cleanly() {
-    use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
 
     use claude_acp_sdk::SessionConfig;
-    use uuid::Uuid;
 
-    let script_dir = std::env::temp_dir().join(format!("claude-acp-sdk-close-{}", Uuid::new_v4()));
-    std::fs::create_dir_all(&script_dir).unwrap();
-    let script_path = script_dir.join("mock-claude.sh");
-    std::fs::write(&script_path, "#!/bin/sh\nsleep 60\n").unwrap();
-    std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let sandbox = ScriptSandbox::new();
 
-    let cfg = SessionConfig::new().claude_path(&script_path);
+    // 1. Direct `exec sleep 60` child closed immediately after spawn.
+    let exec_script = sandbox.write_executable("mock-exec.sh", "#!/bin/sh\nexec sleep 60\n");
+    let (exec_client, exec_driver) = Client::spawn(
+        SessionConfig::new().claude_path(&exec_script),
+        NoopControlHandler,
+    )
+    .unwrap();
+    let exec_driver_task = tokio::spawn(exec_driver);
+    exec_client.close();
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        assert!(
+            exec_client.next_event().await.unwrap().is_none(),
+            "explicit close must end event stream cleanly with Ok(None)"
+        );
+        exec_driver_task
+            .await
+            .unwrap()
+            .expect("explicit close must resolve driver with Ok(ExitStatus)");
+    })
+    .await
+    .expect("client.close() on exec sleep child must complete within 1s");
+
+    // 2. Shell spawning a background grandchild (`sleep 60 &`) that inherits open
+    // `stdout` and `stderr` descriptors (matching Linux `dash` non-exec behavior).
+    let ready_frame = serde_json::to_string(&json!({
+        "type": "system",
+        "subtype": "init",
+        "session_id": "sess-close",
+        "cwd": "/tmp",
+        "model": "claude-sonnet-4-6"
+    }))
+    .unwrap();
+    let grandchild_script = sandbox.write_executable(
+        "mock-grandchild.sh",
+        "#!/bin/sh\nsleep 60 & printf '%s\\n' \"$!\" > \"$MOCK_GRANDCHILD_PID_FILE\"; printf 'stderr-held\\n' >&2; printf '%s\\n' \"$MOCK_READY_FRAME\"; wait\n",
+    );
+
+    let cfg = SessionConfig::new()
+        .claude_path(&grandchild_script)
+        .env_var(
+            "MOCK_GRANDCHILD_PID_FILE",
+            sandbox.grandchild_pid_file.to_str().unwrap(),
+        )
+        .env_var("MOCK_READY_FRAME", ready_frame);
     let (client, driver) = Client::spawn(cfg, NoopControlHandler).unwrap();
     let driver_task = tokio::spawn(driver);
 
+    let first_event = tokio::time::timeout(Duration::from_secs(5), client.next_event())
+        .await
+        .expect("timed out waiting for mock child ready event")
+        .unwrap();
+    assert!(matches!(first_event, Some(SessionEvent::System(_))));
+
     client.close();
 
-    assert!(
-        client.next_event().await.unwrap().is_none(),
-        "explicit close must end event stream cleanly with Ok(None)"
-    );
-    let status = driver_task
-        .await
-        .unwrap()
-        .expect("explicit close must resolve driver with Ok(ExitStatus)");
-    let _ = status;
-
-    let _ = std::fs::remove_dir_all(&script_dir);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        assert!(
+            client.next_event().await.unwrap().is_none(),
+            "explicit close must end event stream cleanly with Ok(None)"
+        );
+        driver_task
+            .await
+            .unwrap()
+            .expect("explicit close must resolve driver with Ok(ExitStatus)");
+    })
+    .await
+    .expect("client.close() must resolve within 1s even when a grandchild holds stderr open");
 }
