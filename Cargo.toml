@@ -11,8 +11,11 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/May-Agent/claude-acp"
 
 [workspace.dependencies]
+aither-acp = { git = "https://github.com/May-Agent/aither", branch = "main", default-features = false }
+aither-mcp = { git = "https://github.com/May-Agent/aither", branch = "main", default-features = false }
 async-channel = { version = "2.5", default-features = false, features = ["std"] }
 async-fs = { version = "2.2", default-features = false }
+async-lock = { version = "3.4", default-features = false, features = ["std"] }
 async-process = { version = "2.5", default-features = false }
 chrono = { version = "0.4.45", default-features = false, features = ["std"] }
 claude-codes = { version = "2.1.327", default-features = false, features = ["types"] }
@@ -47,10 +50,28 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Agent Client Protocol server backed by Claude Agents"
+readme = "README.md"
 publish = false
 
+[features]
+default = ["process"]
+process = ["claude-acp-sdk/process"]
+
 [dependencies]
-claude-acp-sdk = { path = "sdk", version = "0.1.0" }
+aither-acp.workspace = true
+aither-mcp.workspace = true
+async-lock.workspace = true
+chrono.workspace = true
+claude-acp-sdk = { path = "sdk", version = "0.1.0", default-features = false }
+futures-lite.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+async-channel.workspace = true
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "time"] }
 
 [lints]
 workspace = true
