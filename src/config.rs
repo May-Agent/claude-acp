@@ -218,6 +218,8 @@ impl Default for ClaudeAcpConfig {
                 name: env!("CARGO_PKG_NAME").to_string(),
                 title: Some("Claude Code".to_string()),
                 version: env!("CARGO_PKG_VERSION").to_string(),
+                meta: None,
+                extra: std::collections::BTreeMap::new(),
             },
             connector: default_connector(),
         }

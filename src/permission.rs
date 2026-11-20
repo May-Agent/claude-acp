@@ -1,14 +1,17 @@
 //! Session permission memory and `ControlHandler` bridging `can_use_tool` onto
 //! `ClientPeer::request_permission`.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use aither_acp::{
-    ClientPeer, CurrentModeUpdate, PermissionOption, PermissionOptionKind,
-    RequestPermissionOutcome, RequestPermissionParams, SessionNotification, SessionUpdate,
-    ToolCallStatus,
+use aither_acp::SessionId;
+use aither_acp::domain::{ConfigValueId, PermissionOptionId};
+use aither_acp::domain::{
+    CurrentModeUpdate, Open, PermissionOption, PermissionOptionKind, PermissionOutcome,
+    PermissionRequest, PermissionSubject, SessionUpdate, ToolCallStatus, ToolCallSubject,
 };
+use aither_acp::server::SessionContext;
 use claude_acp_sdk::{
     ControlHandler, Permission, PermissionBehavior, PermissionDecision, PermissionDestination,
     PermissionModeName, PermissionType, ToolPermissionRequest,
@@ -283,32 +286,38 @@ fn wildcard_match(pattern: &str, candidate: &str) -> bool {
     p_idx == pat_chars.len()
 }
 
+fn perm_option(id: &str, name: &str, kind: PermissionOptionKind) -> PermissionOption {
+    PermissionOption {
+        option_id: PermissionOptionId::from_string(id),
+        name: name.to_string(),
+        kind: Open::Known(kind),
+        meta: None,
+        extra: BTreeMap::default(),
+    }
+}
+
 fn default_permission_options() -> Vec<PermissionOption> {
     vec![
-        PermissionOption {
-            option_id: OPT_ALLOW_ONCE.to_string(),
-            name: "Allow once".to_string(),
-            kind: PermissionOptionKind::AllowOnce,
-            meta: None,
-        },
-        PermissionOption {
-            option_id: OPT_ALLOW_ALWAYS.to_string(),
-            name: "Allow for session".to_string(),
-            kind: PermissionOptionKind::AllowAlways,
-            meta: None,
-        },
-        PermissionOption {
-            option_id: OPT_REJECT_ONCE.to_string(),
-            name: "Reject once".to_string(),
-            kind: PermissionOptionKind::RejectOnce,
-            meta: None,
-        },
-        PermissionOption {
-            option_id: OPT_REJECT_ALWAYS.to_string(),
-            name: "Reject for session".to_string(),
-            kind: PermissionOptionKind::RejectAlways,
-            meta: None,
-        },
+        perm_option(
+            OPT_ALLOW_ONCE,
+            "Allow once",
+            PermissionOptionKind::AllowOnce,
+        ),
+        perm_option(
+            OPT_ALLOW_ALWAYS,
+            "Allow for session",
+            PermissionOptionKind::AllowAlways,
+        ),
+        perm_option(
+            OPT_REJECT_ONCE,
+            "Reject once",
+            PermissionOptionKind::RejectOnce,
+        ),
+        perm_option(
+            OPT_REJECT_ALWAYS,
+            "Reject for session",
+            PermissionOptionKind::RejectAlways,
+        ),
     ]
 }
 
@@ -316,8 +325,7 @@ fn default_permission_options() -> Vec<PermissionOption> {
 /// `can_use_tool` prompts over [`ClientPeer::request_permission`].
 #[derive(Debug, Clone)]
 pub struct SessionControlHandler {
-    session_id: String,
-    peer: ClientPeer,
+    cx: SessionContext,
     memory: Arc<PermissionMemory>,
     mode: Arc<Mutex<AcpMode>>,
     turn_cancelled: Arc<AtomicBool>,
@@ -325,15 +333,13 @@ pub struct SessionControlHandler {
 
 impl SessionControlHandler {
     pub(crate) const fn new(
-        session_id: String,
-        peer: ClientPeer,
+        cx: SessionContext,
         memory: Arc<PermissionMemory>,
         mode: Arc<Mutex<AcpMode>>,
         turn_cancelled: Arc<AtomicBool>,
     ) -> Self {
         Self {
-            session_id,
-            peer,
+            cx,
             memory,
             mode,
             turn_cancelled,
@@ -342,6 +348,7 @@ impl SessionControlHandler {
 }
 
 impl ControlHandler for SessionControlHandler {
+    #[allow(clippy::too_many_lines)]
     async fn can_use_tool(
         &self,
         req: ToolPermissionRequest,
@@ -362,22 +369,36 @@ impl ControlHandler for SessionControlHandler {
             .clone()
             .unwrap_or_else(|| format!("perm-{}", uuid::Uuid::new_v4()));
         let tool_call = build_tool_call(
-            tool_call_id,
+            &tool_call_id,
             &req.tool_name,
             &req.input,
             ToolCallStatus::Pending,
         );
+        let title = tool_call
+            .title
+            .clone()
+            .into_option()
+            .unwrap_or_else(|| req.tool_name.clone());
 
         let options = default_permission_options();
-        let params = RequestPermissionParams {
-            session_id: self.session_id.clone(),
-            tool_call,
+        let params = PermissionRequest {
+            session_id: SessionId::from_string(self.cx.session_id().as_str()),
+            title,
+            description: None,
+            subject: Some(Open::Known(PermissionSubject::ToolCall(Box::new(
+                ToolCallSubject {
+                    tool_call,
+                    meta: None,
+                    extra: BTreeMap::default(),
+                },
+            )))),
             options: options.clone(),
             meta: None,
+            extra: BTreeMap::default(),
         };
 
-        let response = match self.peer.request_permission(params).await {
-            Ok(resp) => resp,
+        let outcome = match self.cx.request_permission(params).await {
+            Ok(outcome) => outcome,
             Err(err) => {
                 return Ok(PermissionDecision::deny_and_interrupt(format!(
                     "permission request failed: {err}"
@@ -385,18 +406,24 @@ impl ControlHandler for SessionControlHandler {
             }
         };
 
-        match response.outcome {
-            RequestPermissionOutcome::Cancelled => {
+        match outcome {
+            PermissionOutcome::Cancelled(_) | PermissionOutcome::Unknown(..) => {
                 self.turn_cancelled.store(true, Ordering::SeqCst);
                 Ok(PermissionDecision::deny_and_interrupt(
                     "permission request cancelled by client",
                 ))
             }
-            RequestPermissionOutcome::Selected { option_id } => {
+            PermissionOutcome::Custom(..) => Ok(PermissionDecision::deny(
+                "unrecognized permission outcome".to_string(),
+            )),
+            PermissionOutcome::Selected(selected) => {
                 let kind = options
                     .iter()
-                    .find(|opt| opt.option_id == option_id)
-                    .map(|opt| opt.kind);
+                    .find(|opt| opt.option_id == selected.option_id)
+                    .and_then(|opt| match &opt.kind {
+                        Open::Known(k) => Some(*k),
+                        _ => None,
+                    });
 
                 match kind {
                     Some(PermissionOptionKind::AllowOnce) => Ok(PermissionDecision::allow()),
@@ -409,14 +436,12 @@ impl ControlHandler for SessionControlHandler {
                                 *guard = new_mode;
                             }
                             let _ = self
-                                .peer
-                                .session_update(SessionNotification::new(
-                                    &self.session_id,
-                                    SessionUpdate::CurrentModeUpdate(CurrentModeUpdate {
-                                        current_mode_id: new_mode.as_str().to_string(),
-                                        meta: None,
-                                    }),
-                                ))
+                                .cx
+                                .update(SessionUpdate::CurrentModeUpdate(CurrentModeUpdate {
+                                    current_mode_id: ConfigValueId::from_string(new_mode.as_str()),
+                                    meta: None,
+                                    extra: BTreeMap::default(),
+                                }))
                                 .await;
                         }
                         Ok(PermissionDecision::allow().with_permissions(updated_perms))
@@ -432,7 +457,8 @@ impl ControlHandler for SessionControlHandler {
                         )))
                     }
                     None => Ok(PermissionDecision::deny(format!(
-                        "unrecognized permission option `{option_id}`"
+                        "unrecognized permission option `{}`",
+                        selected.option_id.as_str()
                     ))),
                 }
             }

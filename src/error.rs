@@ -1,7 +1,7 @@
 //! Error types for `claude-acp` and conversions to JSON-RPC errors.
 
-use aither_acp::{JsonRpcError, ServerError};
-use aither_mcp::protocol::ErrorCode;
+use aither_acp::rpc::RpcError;
+use aither_acp::server::ServerError;
 use claude_acp_sdk::SdkError;
 
 /// Convenience result alias returning [`ClaudeAcpError`].
@@ -14,7 +14,7 @@ pub enum ClaudeAcpError {
     #[error(transparent)]
     Sdk(#[from] SdkError),
 
-    /// Underlying `aither-acp` server transport/peer error.
+    /// Underlying `aither-acp` server error.
     #[error(transparent)]
     Server(#[from] ServerError),
 
@@ -32,24 +32,24 @@ pub enum ClaudeAcpError {
 }
 
 impl ClaudeAcpError {
-    /// Convert this error into a protocol [`JsonRpcError`].
+    /// Convert this error into a protocol [`RpcError`].
     #[must_use]
-    pub fn into_rpc_error(self) -> JsonRpcError {
+    pub fn into_rpc_error(self) -> RpcError {
         match self {
             Self::SessionNotFound(id) => {
-                JsonRpcError::invalid_params(format!("Session not found: {id}"))
+                RpcError::invalid_params(format!("Session not found: {id}"))
             }
-            Self::InvalidParams(msg) => JsonRpcError::invalid_params(msg),
-            Self::Auth(msg) => JsonRpcError::new(ErrorCode(-32000), msg),
-            Self::Sdk(SdkError::Control { message, .. }) => JsonRpcError::invalid_params(message),
-            Self::Sdk(err) => JsonRpcError::internal_error(err.to_string()),
-            Self::Server(ServerError::JsonRpc(rpc)) => rpc,
-            Self::Server(err) => JsonRpcError::internal_error(err.to_string()),
+            Self::InvalidParams(msg) => RpcError::invalid_params(msg),
+            Self::Auth(msg) => RpcError::new(-32000, msg),
+            Self::Sdk(SdkError::Control { message, .. }) => RpcError::invalid_params(message),
+            Self::Sdk(err) => RpcError::internal_error(err.to_string()),
+            Self::Server(ServerError::Rpc(rpc)) => rpc,
+            Self::Server(err) => RpcError::internal_error(err.to_string()),
         }
     }
 }
 
-impl From<ClaudeAcpError> for JsonRpcError {
+impl From<ClaudeAcpError> for RpcError {
     fn from(err: ClaudeAcpError) -> Self {
         err.into_rpc_error()
     }
