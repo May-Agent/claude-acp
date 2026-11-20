@@ -110,12 +110,9 @@ impl ClaudeAgent {
     /// Panics if the internal auth-state mutex is poisoned.
     pub async fn handle_auth_request(&self, request: AuthRequest) -> Result<()> {
         let status = match request {
-            AuthRequest::Login(method_id) => {
+            AuthRequest::Login(req) => {
                 let mut auth = self.inner.auth.lock().expect("auth mutex poisoned");
-                // NOTE: the rewritten aither-acp `AuthRequest::Login` drops the
-                // request `_meta`, so an inline `apiKey`/account payload cannot
-                // reach the agent; api-key auth relies on ambient credentials.
-                auth.authenticate(method_id.as_str(), None)?
+                auth.authenticate(req.method_id.as_str(), req.meta.as_ref())?
             }
             AuthRequest::Logout(_) => {
                 let mut auth = self.inner.auth.lock().expect("auth mutex poisoned");

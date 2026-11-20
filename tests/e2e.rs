@@ -974,7 +974,7 @@ async fn session_list_replay_resume_and_delete() {
         .await
         .expect("session/resume replay");
     mock1.await.expect("mock cli task");
-    let (_rec_task, _events) = record_events(&resumed);
+    let (rec_task, _events) = record_events(&resumed);
 
     // Replay updates are consumed by the reducer while `open()` runs, so the
     // folded state already carries the transcript's user message.
@@ -983,7 +983,7 @@ async fn session_list_replay_resume_and_delete() {
         msgs_json.contains("persisted-"),
         "expected replayed user message in session state: {msgs_json}"
     );
-    drop(_rec_task);
+    drop(rec_task);
     // The framework rejects resuming a session id that is still live.
     resumed.close().await.expect("session/close");
 
