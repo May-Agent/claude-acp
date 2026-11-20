@@ -11,8 +11,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/May-Agent/claude-acp"
 
 [workspace.dependencies]
-aither-acp = { git = "https://github.com/May-Agent/aither", branch = "main", default-features = false }
-aither-mcp = { git = "https://github.com/May-Agent/aither", branch = "main", default-features = false }
+aither-acp = { git = "https://github.com/May-Agent/aither", branch = "main", default-features = false, features = ["stdio"] }
 async-channel = { version = "2.5", default-features = false, features = ["std"] }
 async-fs = { version = "2.2", default-features = false }
 async-lock = { version = "3.4", default-features = false, features = ["std"] }
@@ -59,7 +58,6 @@ process = ["claude-acp-sdk/process"]
 
 [dependencies]
 aither-acp.workspace = true
-aither-mcp.workspace = true
 async-lock.workspace = true
 chrono.workspace = true
 claude-acp-sdk = { path = "sdk", version = "0.1.0", default-features = false }

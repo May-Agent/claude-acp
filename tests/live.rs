@@ -1,61 +1,26 @@
-//! Live end-to-end smoke test driving `claude-acp` via `aither_acp::AcpClient`
+//! Live end-to-end smoke test driving `claude-acp` via `aither_acp::Client`
 //! against a real authenticated `claude` CLI binary (`cargo test -- --ignored`).
 
 #![cfg(feature = "process")]
 
-use std::future::Future;
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use aither_acp::{
-    AcpClient, ClientHandler, ContentBlock, PermissionOptionKind, PromptParams,
-    RequestPermissionOutcome, RequestPermissionParams, RequestPermissionResult, SessionCloseParams,
-    SessionNewParams, SessionNotification, SessionUpdate, StopReason, TextContent,
+use aither_acp::domain::{
+    CancelledOutcome, ContentBlock, Open, PermissionOptionKind, PermissionOutcome,
+    PermissionRequest, SelectedOutcome, StopReason, TextContent,
 };
-use aither_mcp::protocol::JsonRpcError;
-use aither_mcp::transport::DuplexTransport;
+use aither_acp::rpc::Memory;
+use aither_acp::{Client, Implementation, TurnOutcome};
 use claude_acp::sdk::{ClaudeModel, SpawnConfig};
 use claude_acp::{ClaudeAcpConfig, serve};
-
-#[derive(Clone, Default)]
-struct LiveCollector {
-    chunks: Arc<Mutex<Vec<String>>>,
-}
-
-impl ClientHandler for LiveCollector {
-    fn session_update(&self, notification: SessionNotification) -> impl Future<Output = ()> + Send {
-        if let SessionUpdate::AgentMessageChunk(chunk) = notification.update
-            && let ContentBlock::Text(text) = chunk.content
-        {
-            self.chunks.lock().unwrap().push(text.text);
-        }
-        std::future::ready(())
-    }
-
-    fn request_permission(
-        &self,
-        params: RequestPermissionParams,
-    ) -> impl Future<Output = Result<RequestPermissionResult, JsonRpcError>> + Send {
-        let allow_id = params
-            .options
-            .iter()
-            .find(|opt| opt.kind == PermissionOptionKind::AllowOnce)
-            .map(|opt| opt.option_id.clone());
-        let outcome = allow_id.map_or(RequestPermissionOutcome::Cancelled, |option_id| {
-            RequestPermissionOutcome::Selected { option_id }
-        });
-        std::future::ready(Ok(RequestPermissionResult {
-            outcome,
-            meta: None,
-        }))
-    }
-}
 
 #[tokio::test]
 #[ignore = "requires an authenticated local `claude` CLI installation"]
 async fn live_acp_round_trip_with_real_claude_cli() {
-    let collector = LiveCollector::default();
-    let (client_transport, server_transport) = DuplexTransport::pair();
+    let chunks: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let (client_transport, server_transport) = Memory::pair();
 
     let spawn = SpawnConfig::new()
         .model(ClaudeModel::Haiku)
@@ -66,54 +31,80 @@ async fn live_acp_round_trip_with_real_claude_cli() {
         .default_mode("read-only");
 
     let (_peer, server_conn) = serve(server_transport, config);
-    let (client, client_conn) = AcpClient::connect(client_transport, collector.clone());
-
+    // The server must be polled before `connect` can complete `initialize`.
     let server_task = tokio::spawn(server_conn);
+    let (client, client_conn) = Client::builder(Implementation::new("live-test", "0.0.0"))
+        .permissions(|request: PermissionRequest| async move {
+            let allow_id = request
+                .options
+                .iter()
+                .find(|opt| matches!(&opt.kind, Open::Known(PermissionOptionKind::AllowOnce)))
+                .map(|opt| opt.option_id.clone());
+            allow_id.map_or_else(
+                || PermissionOutcome::Cancelled(CancelledOutcome { meta: None }),
+                |option_id| {
+                    PermissionOutcome::Selected(SelectedOutcome {
+                        option_id,
+                        meta: None,
+                    })
+                },
+            )
+        })
+        .connect(client_transport)
+        .await
+        .expect("ACP connect");
+
     let client_task = tokio::spawn(client_conn);
 
-    let init = tokio::time::timeout(Duration::from_secs(15), client.initialize())
-        .await
-        .expect("ACP initialize timed out")
-        .expect("ACP initialize failed");
-    assert!(init.agent_capabilities.load_session);
-
     let cwd = std::env::temp_dir();
-    let session = tokio::time::timeout(
-        Duration::from_secs(30),
-        client.new_session(SessionNewParams::new(&cwd)),
-    )
-    .await
-    .expect("session/new timed out")
-    .expect("session/new failed");
+    let session = tokio::time::timeout(Duration::from_secs(30), client.new_session(&cwd).open())
+        .await
+        .expect("session/new timed out")
+        .expect("session/new failed");
 
-    let prompt_res = tokio::time::timeout(
+    {
+        let mut events = session.subscribe();
+        let sink = Arc::clone(&chunks);
+        tokio::spawn(async move {
+            use aither_acp::SessionEvent;
+            use futures_lite::StreamExt;
+            while let Some(ev) = events.next().await {
+                if let SessionEvent::MessageDelta { text: Some(t), .. } = ev {
+                    sink.lock().unwrap().push(t);
+                }
+            }
+        });
+    }
+
+    let outcome = tokio::time::timeout(
         Duration::from_secs(60),
-        client.prompt(PromptParams::new(
-            &session.session_id,
-            vec![ContentBlock::Text(TextContent {
-                text: "Reply with the exact word PONG and nothing else.".to_string(),
-                annotations: None,
-                meta: None,
-            })],
-        )),
+        session.prompt_run(vec![ContentBlock::Text(TextContent {
+            text: "Reply with the exact word PONG and nothing else.".to_string(),
+            annotations: None,
+            meta: None,
+            extra: BTreeMap::default(),
+        })]),
     )
     .await
     .expect("session/prompt timed out")
     .expect("session/prompt failed");
 
-    assert_eq!(prompt_res.stop_reason, StopReason::EndTurn);
+    let TurnOutcome::Finished { stop_reason, .. } = outcome else {
+        panic!("expected Finished, got {outcome:?}");
+    };
+    assert!(matches!(
+        stop_reason,
+        Some(Open::Known(StopReason::EndTurn))
+    ));
 
-    let combined = collector.chunks.lock().unwrap().join("");
+    let combined = chunks.lock().unwrap().join("");
     assert!(
         combined.to_uppercase().contains("PONG"),
         "expected PONG in streamed chunks, got: {combined:?}"
     );
 
-    client
-        .close_session(SessionCloseParams::new(&session.session_id))
-        .await
-        .expect("session/close failed");
-    client.close();
+    session.close().await.expect("session/close failed");
+    client.close().await;
 
     tokio::time::timeout(Duration::from_secs(10), client_task)
         .await

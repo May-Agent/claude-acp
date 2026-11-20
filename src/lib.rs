@@ -1,16 +1,18 @@
-//! Agent Client Protocol (ACP v1) server backed by Claude Code (`claude-acp-sdk`)
-//! and built onto [`aither_acp::AgentHandler`] and [`ClientPeer`] abstractions.
+//! Agent Client Protocol (ACP v1+v2) server backed by Claude Code
+//! (`claude-acp-sdk`) and built onto the rewritten [`aither_acp`] dual-stack
+//! `Server`/`SessionHost`/`Session` API.
 //!
 //! # Architecture
 //!
 //! `claude-acp` bridges editor/orchestrator ACP JSON-RPC traffic onto Claude
 //! Code's bidirectional `stream-json` control protocol:
 //!
-//! - [`ClaudeAgent`] implements [`aither_acp::AgentHandler`] without tying library
-//!   code to any specific async runtime.
-//! - [`serve`] drives a [`ClaudeAgent`] over any [`BidirectionalTransport`]
-//!   (such as pipes, sockets, or [`aither_mcp::transport::DuplexTransport`]),
-//!   cleaning up all live sessions when the connection closes.
+//! - [`ClaudeAgent`] implements [`aither_acp::server::SessionHost`] without
+//!   tying library code to any specific async runtime; each ACP session is a
+//!   [`ClaudeSession`] implementing [`aither_acp::server::Session`].
+//! - [`serve`] drives a [`ClaudeAgent`] over any [`aither_acp::Transport`]
+//!   (NDJSON lines, in-memory pairs, child processes), cleaning up all live
+//!   sessions when the connection closes.
 //! - [`serve_stdio`] runs the server over process `stdin`/`stdout`.
 //! - [`SessionConnector`] decouples session transport creation so integration
 //!   tests can attach in-memory mock CLI streams via
@@ -42,8 +44,8 @@ mod session;
 use std::future::Future;
 
 pub use aither_acp as acp;
-use aither_acp::ClientPeer;
-use aither_mcp::transport::{BidirectionalTransport, StdioTransport};
+use aither_acp::rpc::Peer;
+use aither_acp::server::{AuthConfig, AuthRequest, Server};
 pub use claude_acp_sdk as sdk;
 
 pub use agent::ClaudeAgent;
@@ -53,31 +55,61 @@ pub use config::ProcessSessionConnector;
 pub use config::{ClaudeAcpConfig, ConnectedSession, SessionConnector};
 pub use error::{ClaudeAcpError, Result};
 pub use mode::AcpMode;
+pub use session::ClaudeSession;
 
 /// Serve a [`ClaudeAgent`] configured with `config` over an arbitrary
-/// [`BidirectionalTransport`].
+/// [`aither_acp::Transport`].
 ///
-/// Returns a [`ClientPeer`] handle for agent-initiated notifications/requests
-/// alongside the connection future that drives the transport and shuts down all
-/// live SDK sessions when the connection ends.
-pub fn serve<T>(
-    transport: T,
-    config: ClaudeAcpConfig,
-) -> (ClientPeer, impl Future<Output = ()> + Send)
+/// Returns a [`Peer`] handle for agent-initiated notifications/requests
+/// alongside the connection future that drives the transport and shuts down
+/// all live SDK sessions when the connection ends.
+pub fn serve<T>(transport: T, config: ClaudeAcpConfig) -> (Peer, impl Future<Output = ()> + Send)
 where
-    T: BidirectionalTransport,
+    T: aither_acp::Transport + 'static,
 {
+    let agent_info = config.agent_info.clone();
     let agent = ClaudeAgent::new(config);
-    let shutdown_agent = agent.clone();
-    let (peer, connection) = aither_acp::serve(transport, agent);
-    let wrapped = async move {
-        connection.await;
-        shutdown_agent.shutdown_all().await;
-    };
-    (peer, wrapped)
+    let auth = AuthConfig::new(agent.auth_methods(), {
+        let agent = agent.clone();
+        move |request: AuthRequest| {
+            let agent = agent.clone();
+            async move {
+                agent
+                    .handle_auth_request(request)
+                    .await
+                    .map_err(ClaudeAcpError::into_rpc_error)
+            }
+        }
+    });
+    let server = Server::builder(agent.clone(), agent_info)
+        .auth(auth)
+        .build();
+    let (peer, connection) = server.serve(transport);
+    agent.set_peer(peer.clone());
+    (peer, connection)
 }
 
-/// Serve a [`ClaudeAgent`] configured with `config` over standard input and output.
-pub fn serve_stdio(config: ClaudeAcpConfig) -> (ClientPeer, impl Future<Output = ()> + Send) {
-    serve(StdioTransport::new(), config)
+/// Serve a [`ClaudeAgent`] configured with `config` over standard input and
+/// output.
+pub fn serve_stdio(config: ClaudeAcpConfig) -> (Peer, impl Future<Output = ()> + Send) {
+    let agent_info = config.agent_info.clone();
+    let agent = ClaudeAgent::new(config);
+    let auth = AuthConfig::new(agent.auth_methods(), {
+        let agent = agent.clone();
+        move |request: AuthRequest| {
+            let agent = agent.clone();
+            async move {
+                agent
+                    .handle_auth_request(request)
+                    .await
+                    .map_err(ClaudeAcpError::into_rpc_error)
+            }
+        }
+    });
+    let server = Server::builder(agent.clone(), agent_info)
+        .auth(auth)
+        .build();
+    let (peer, connection) = server.serve_stdio();
+    agent.set_peer(peer.clone());
+    (peer, connection)
 }

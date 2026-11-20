@@ -1,16 +1,15 @@
 //! Authentication methods (`api-key`, `claude-login`), credential state, and
 //! `_auth/status_update` extension notifications.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::path::Path;
 
+use aither_acp::AgentCapabilities;
+use aither_acp::domain::{AgentAuth, AuthKind, AuthMethod, AuthMethodId, Open, TerminalAuth};
 use aither_acp::ext::auth_status::{
-    self, AuthStatus, AuthStatusAccount, AuthStatusKind, CAPABILITY, METHOD,
+    self, AuthStatus, AuthStatusAccount, AuthStatusKind, CAPABILITY,
 };
-use aither_acp::{
-    AgentAuthCapabilities, AgentCapabilities, AuthMethod, AuthMethodAgent, AuthMethodTerminal,
-    AuthenticateParams, ClientPeer, LogoutCapabilities,
-};
+use aither_acp::rpc::Peer;
 use claude_acp_sdk::{AuthStatusMessage, SpawnConfig};
 use serde_json::{Value, json};
 
@@ -24,13 +23,10 @@ pub const AUTH_METHOD_CLAUDE_LOGIN: &str = "claude-login";
 
 const VENDOR_ANTHROPIC: &str = "Anthropic";
 
-/// Attach `auth` (`logout: {}`) and `_meta.authStatus: {}` capabilities onto
-/// [`AgentCapabilities`].
+/// Attach the `_meta.authStatus` capability marker plus the v1-style
+/// `auth.logout` capability object onto [`AgentCapabilities`].
 pub fn apply_auth_capabilities(caps: &mut AgentCapabilities) {
-    caps.auth = Some(AgentAuthCapabilities {
-        logout: Some(LogoutCapabilities::default()),
-        meta: None,
-    });
+    caps.auth = Some(json!({"logout": true}));
     let mut meta_obj = caps
         .meta
         .take()
@@ -42,36 +38,49 @@ pub fn apply_auth_capabilities(caps: &mut AgentCapabilities) {
 
 /// Build the list of [`AuthMethod`]s advertised in `initialize`.
 ///
-/// When the client advertises `clientCapabilities.auth.terminal == true`,
+/// When the client advertises `clientCapabilities.auth.terminal`,
 /// `claude-login` is exposed as a terminal auth method invoking
 /// `<claude> auth login`; otherwise it is exposed as an agent-managed method.
 pub fn build_auth_methods(
     client_supports_terminal_auth: bool,
     claude_executable: &Path,
 ) -> Vec<AuthMethod> {
-    let api_key = AuthMethod::Agent(
-        AuthMethodAgent::new(AUTH_METHOD_API_KEY, "Anthropic API Key")
-            .description("Authenticate using an Anthropic API key"),
-    );
+    let api_key = AuthMethod {
+        method_id: AuthMethodId::from_string(AUTH_METHOD_API_KEY),
+        name: "Anthropic API Key".to_string(),
+        description: Some("Authenticate using an Anthropic API key".to_string()),
+        kind: Open::Known(AuthKind::Agent(AgentAuth::default())),
+        meta: None,
+        extra: BTreeMap::new(),
+    };
 
     let login = if client_supports_terminal_auth {
-        AuthMethod::Terminal(AuthMethodTerminal {
-            id: AUTH_METHOD_CLAUDE_LOGIN.to_string(),
+        AuthMethod {
+            method_id: AuthMethodId::from_string(AUTH_METHOD_CLAUDE_LOGIN),
             name: "Claude Login".to_string(),
             description: Some("Sign in interactively with your Claude account".to_string()),
-            args: vec![
-                claude_executable.to_string_lossy().into_owned(),
-                "auth".to_string(),
-                "login".to_string(),
-            ],
-            env: HashMap::new(),
+            kind: Open::Known(AuthKind::Terminal(TerminalAuth {
+                args: vec![
+                    claude_executable.to_string_lossy().into_owned(),
+                    "auth".to_string(),
+                    "login".to_string(),
+                ],
+                env: Vec::new(),
+                meta: None,
+                extra: BTreeMap::new(),
+            })),
             meta: None,
-        })
+            extra: BTreeMap::new(),
+        }
     } else {
-        AuthMethod::Agent(
-            AuthMethodAgent::new(AUTH_METHOD_CLAUDE_LOGIN, "Claude Login")
-                .description("Sign in with your Claude account"),
-        )
+        AuthMethod {
+            method_id: AuthMethodId::from_string(AUTH_METHOD_CLAUDE_LOGIN),
+            name: "Claude Login".to_string(),
+            description: Some("Sign in with your Claude account".to_string()),
+            kind: Open::Known(AuthKind::Agent(AgentAuth::default())),
+            meta: None,
+            extra: BTreeMap::new(),
+        }
     };
 
     vec![api_key, login]
@@ -141,13 +150,18 @@ impl AuthState {
         }
     }
 
-    /// Handle an ACP `authenticate` request and return the updated [`AuthStatus`].
-    pub(crate) fn authenticate(&mut self, params: &AuthenticateParams) -> Result<AuthStatus> {
-        match params.method_id.as_str() {
+    /// Handle an `auth/login` request and return the updated [`AuthStatus`].
+    ///
+    /// `meta` carries the request's `_meta` payload when the transport
+    /// preserved it (extension params such as `apiKey`, `email`, `plan`).
+    pub(crate) fn authenticate(
+        &mut self,
+        method_id: &str,
+        meta: Option<&Value>,
+    ) -> Result<AuthStatus> {
+        match method_id {
             AUTH_METHOD_API_KEY => {
-                let supplied_key = params
-                    .meta
-                    .as_ref()
+                let supplied_key = meta
                     .and_then(Value::as_object)
                     .and_then(|obj| {
                         obj.get("apiKey")
@@ -191,7 +205,7 @@ impl AuthState {
                 }
             }
             AUTH_METHOD_CLAUDE_LOGIN => {
-                let meta_obj = params.meta.as_ref().and_then(Value::as_object);
+                let meta_obj = meta.and_then(Value::as_object);
                 let email = meta_field(meta_obj, "email");
                 let organization = meta_field(meta_obj, "organization")
                     .or_else(|| meta_field(meta_obj, "orgName"));
@@ -274,12 +288,28 @@ impl AuthState {
     }
 }
 
-/// Push an `_auth/status_update` notification to the connected ACP client.
-pub async fn notify_auth_status(peer: &ClientPeer, status: &AuthStatus) -> Result<()> {
+/// Push an `_auth/status_update` notification over the connection-level peer.
+pub async fn notify_auth_status(peer: &Peer, status: &AuthStatus) -> Result<()> {
     let payload = json!({
         auth_status::CAPABILITY: status,
     });
-    peer.ext_notify(METHOD, Some(payload)).await?;
+    peer.notify(auth_status::METHOD.as_str(), &payload)
+        .await
+        .map_err(|e| ClaudeAcpError::Server(e.into()))?;
+    Ok(())
+}
+
+/// Push an `_auth/status_update` notification through a session context.
+pub async fn notify_auth_status_cx(
+    cx: &aither_acp::SessionContext,
+    status: &AuthStatus,
+) -> Result<()> {
+    let payload = json!({
+        auth_status::CAPABILITY: status,
+    });
+    cx.notify(auth_status::METHOD.as_str(), Some(payload))
+        .await
+        .map_err(|e| ClaudeAcpError::Server(e.into()))?;
     Ok(())
 }
 
