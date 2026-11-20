@@ -11,7 +11,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/May-Agent/claude-acp"
 
 [workspace.dependencies]
-aither-acp = { git = "https://github.com/May-Agent/aither", branch = "feat/acp-v1v2-redesign", default-features = false, features = ["stdio"] }
+aither-acp = { git = "https://github.com/May-Agent/aither", branch = "main", default-features = false, features = ["stdio"] }
 async-channel = { version = "2.5", default-features = false, features = ["std"] }
 async-fs = { version = "2.2", default-features = false }
 async-lock = { version = "3.4", default-features = false, features = ["std"] }
