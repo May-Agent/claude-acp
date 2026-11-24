@@ -155,6 +155,162 @@ pub struct McpStatusResponse {
     pub extra: Map<String, Value>,
 }
 
+/// One category row returned in [`ContextUsageResponse::categories`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextUsageCategory {
+    /// Display name of the category (e.g. `"System prompt"`, `"Messages"`).
+    #[serde(default)]
+    pub name: String,
+    /// Estimated token count attributed to this category.
+    #[serde(default)]
+    pub tokens: u64,
+    /// Optional display color reported by the CLI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    /// Whether this category represents deferred schemas not yet materialized.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_deferred: Option<bool>,
+    /// Additional forward-compatible fields preserved verbatim.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+/// Token contribution of one MCP tool in [`ContextUsageResponse::mcp_tools`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextUsageMcpTool {
+    /// Wire tool name (e.g. `"mcp__fs__read"`).
+    #[serde(default)]
+    pub name: String,
+    /// Owning MCP server name, if reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_name: Option<String>,
+    /// Estimated token cost of this tool's schema.
+    #[serde(default)]
+    pub tokens: u64,
+    /// Whether the tool schema is loaded (`Some(false)` indicates deferred).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_loaded: Option<bool>,
+    /// Additional forward-compatible fields preserved verbatim.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+/// Token contribution of one memory file in [`ContextUsageResponse::memory_files`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextUsageMemoryFile {
+    /// Path to the memory file reported by the CLI.
+    #[serde(default)]
+    pub path: String,
+    /// Memory file source type (e.g. `"Project"`, `"User"`), if reported.
+    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
+    pub file_type: Option<String>,
+    /// Estimated token count for this file.
+    #[serde(default)]
+    pub tokens: u64,
+    /// Additional forward-compatible fields preserved verbatim.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+/// Token contribution of one agent definition in [`ContextUsageResponse::agents`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextUsageAgent {
+    /// Agent type identifier (e.g. `"Explore"`).
+    #[serde(default)]
+    pub agent_type: String,
+    /// Origin source of the agent definition, if reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Estimated token count for this agent definition.
+    #[serde(default)]
+    pub tokens: u64,
+    /// Additional forward-compatible fields preserved verbatim.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+/// Token contribution of one skill frontmatter entry in [`ContextUsageSkills::skill_frontmatter`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextUsageSkill {
+    /// Skill name.
+    #[serde(default)]
+    pub name: String,
+    /// Origin source of the skill definition, if reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Estimated token count for this skill's frontmatter.
+    #[serde(default)]
+    pub tokens: u64,
+    /// Additional forward-compatible fields preserved verbatim.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+/// Skill frontmatter breakdown in [`ContextUsageResponse::skills`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextUsageSkills {
+    /// Total tokens across included skill frontmatters, if reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<u64>,
+    /// Per-skill frontmatter token entries.
+    #[serde(default)]
+    pub skill_frontmatter: Vec<ContextUsageSkill>,
+    /// Additional forward-compatible fields preserved verbatim.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+/// Response returned by the Claude CLI for a `get_context_usage` control request.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextUsageResponse {
+    /// Model identifier for which context usage was computed.
+    #[serde(default)]
+    pub model: String,
+    /// Total estimated tokens currently occupying the context window.
+    #[serde(default)]
+    pub total_tokens: u64,
+    /// Effective maximum context window size in tokens.
+    #[serde(default)]
+    pub max_tokens: u64,
+    /// Model's raw maximum context window size in tokens, if reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_max_tokens: Option<u64>,
+    /// Percentage of the context window currently in use, if reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub percentage: Option<f64>,
+    /// Whether automatic compaction is enabled for the session.
+    #[serde(default)]
+    pub is_auto_compact_enabled: bool,
+    /// Token threshold at which automatic compaction triggers, if configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_compact_threshold: Option<u64>,
+    /// Usage-by-category rows (`System prompt`, `Messages`, ...).
+    #[serde(default)]
+    pub categories: Vec<ContextUsageCategory>,
+    /// Per-tool token contributions of configured MCP tools.
+    #[serde(default)]
+    pub mcp_tools: Vec<ContextUsageMcpTool>,
+    /// Per-file token contributions of loaded memory files.
+    #[serde(default)]
+    pub memory_files: Vec<ContextUsageMemoryFile>,
+    /// Per-agent token contributions of available agent definitions.
+    #[serde(default)]
+    pub agents: Vec<ContextUsageAgent>,
+    /// Skill frontmatter breakdown, if reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skills: Option<ContextUsageSkills>,
+    /// Additional forward-compatible fields returned by newer CLI versions.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
 fn deserialize_nullable_vec<'de, D, T>(deserializer: D) -> std::result::Result<Vec<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -873,6 +1029,19 @@ impl Client {
         let request = json!({ "subtype": "mcp_status" });
         let resp = self.send_control("mcp-status", request).await?;
         decode_optional_response("mcp_status", resp)
+    }
+
+    /// Query a structured breakdown of current context window usage
+    /// (`subtype: "get_context_usage"`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SdkError`] if the CLI returns a control error, decoding fails,
+    /// or the connection closes.
+    pub async fn context_usage(&self) -> Result<ContextUsageResponse> {
+        let request = json!({ "subtype": "get_context_usage" });
+        let resp = self.send_control("get-context-usage", request).await?;
+        decode_optional_response("get_context_usage", resp)
     }
 
     /// Send an arbitrary outbound `control_request` body (must be a JSON object

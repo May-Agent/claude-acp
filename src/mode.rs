@@ -23,6 +23,10 @@ pub enum AcpMode {
     /// Standard interactive agent prompting (`PermissionMode::Default`).
     #[default]
     Agent,
+    /// Classifier-guided automatic tool approval (`PermissionMode::Auto`).
+    Auto,
+    /// Deny tools that are not pre-approved without prompting (`PermissionMode::DontAsk`).
+    DontAsk,
     /// Unprompted full tool access (`PermissionMode::BypassPermissions`).
     AgentFullAccess,
 }
@@ -35,6 +39,8 @@ impl AcpMode {
             Self::ReadOnly => "read-only",
             Self::WorkspaceWrite => "workspace-write",
             Self::Agent => "agent",
+            Self::Auto => "auto",
+            Self::DontAsk => "dont-ask",
             Self::AgentFullAccess => "agent-full-access",
         }
     }
@@ -46,6 +52,8 @@ impl AcpMode {
             Self::ReadOnly => "Read Only",
             Self::WorkspaceWrite => "Workspace Write",
             Self::Agent => "Agent",
+            Self::Auto => "Auto",
+            Self::DontAsk => "Don't Ask",
             Self::AgentFullAccess => "Agent (Full Access)",
         }
     }
@@ -57,17 +65,23 @@ impl AcpMode {
             Self::ReadOnly => "Analyze and plan without modifying files or running commands",
             Self::WorkspaceWrite => "Automatically accept file edits within the workspace",
             Self::Agent => "Prompt for approval before modifying files or running commands",
+            Self::Auto => {
+                "Automatically evaluate tool permissions using Claude's safety classifier"
+            }
+            Self::DontAsk => "Deny tools that are not pre-approved without prompting",
             Self::AgentFullAccess => "Bypass permission prompts for all tool executions",
         }
     }
 
     /// All supported [`AcpMode`] variants in display order.
     #[must_use]
-    pub const fn all() -> [Self; 4] {
+    pub const fn all() -> [Self; 6] {
         [
             Self::ReadOnly,
             Self::WorkspaceWrite,
             Self::Agent,
+            Self::Auto,
+            Self::DontAsk,
             Self::AgentFullAccess,
         ]
     }
@@ -82,9 +96,11 @@ impl AcpMode {
             "read-only" => Ok(Self::ReadOnly),
             "workspace-write" => Ok(Self::WorkspaceWrite),
             "agent" => Ok(Self::Agent),
+            "auto" => Ok(Self::Auto),
+            "dont-ask" => Ok(Self::DontAsk),
             "agent-full-access" => Ok(Self::AgentFullAccess),
             other => Err(ClaudeAcpError::InvalidParams(format!(
-                "unsupported session mode `{other}`; expected `read-only`, `workspace-write`, `agent`, or `agent-full-access`"
+                "unsupported session mode `{other}`; expected `read-only`, `workspace-write`, `agent`, `auto`, `dont-ask`, or `agent-full-access`"
             ))),
         }
     }
@@ -96,6 +112,8 @@ impl AcpMode {
             Self::ReadOnly => PermissionMode::Plan,
             Self::WorkspaceWrite => PermissionMode::AcceptEdits,
             Self::Agent => PermissionMode::Default,
+            Self::Auto => PermissionMode::Auto,
+            Self::DontAsk => PermissionMode::DontAsk,
             Self::AgentFullAccess => PermissionMode::BypassPermissions,
         }
     }
@@ -106,11 +124,10 @@ impl AcpMode {
         match mode {
             PermissionMode::Plan => Self::ReadOnly,
             PermissionMode::AcceptEdits => Self::WorkspaceWrite,
+            PermissionMode::Auto => Self::Auto,
+            PermissionMode::DontAsk => Self::DontAsk,
             PermissionMode::BypassPermissions => Self::AgentFullAccess,
-            PermissionMode::Default
-            | PermissionMode::DontAsk
-            | PermissionMode::Auto
-            | PermissionMode::Unknown(_) => Self::Agent,
+            PermissionMode::Default | PermissionMode::Unknown(_) => Self::Agent,
         }
     }
 }
@@ -412,4 +429,74 @@ pub fn build_available_commands(cli_commands: &[CommandInfo]) -> Vec<AvailableCo
     }
 
     commands
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn all_acp_modes_round_trip_wire_id_and_permission_mode() {
+        let expected = [
+            (AcpMode::ReadOnly, "read-only", PermissionMode::Plan),
+            (
+                AcpMode::WorkspaceWrite,
+                "workspace-write",
+                PermissionMode::AcceptEdits,
+            ),
+            (AcpMode::Agent, "agent", PermissionMode::Default),
+            (AcpMode::Auto, "auto", PermissionMode::Auto),
+            (AcpMode::DontAsk, "dont-ask", PermissionMode::DontAsk),
+            (
+                AcpMode::AgentFullAccess,
+                "agent-full-access",
+                PermissionMode::BypassPermissions,
+            ),
+        ];
+
+        assert_eq!(AcpMode::all().len(), expected.len());
+        for (mode, wire, perm) in expected {
+            assert!(AcpMode::all().contains(&mode));
+            assert_eq!(mode.as_str(), wire);
+            assert_ne!(mode.name(), "");
+            assert_ne!(mode.description(), "");
+            assert_eq!(AcpMode::parse(wire).expect("valid mode"), mode);
+            assert_eq!(mode.to_permission_mode(), perm);
+            assert_eq!(AcpMode::from_permission_mode(&perm), mode);
+        }
+
+        assert_eq!(
+            AcpMode::from_permission_mode(&PermissionMode::Unknown("future".to_string())),
+            AcpMode::Agent
+        );
+        assert!(AcpMode::parse("nonexistent").is_err());
+    }
+
+    #[test]
+    fn build_config_options_advertises_all_six_modes() {
+        let opts = build_config_options(AcpMode::Auto, "sonnet", &[], &ReasoningSetting::default());
+        let mode_opt = opts
+            .iter()
+            .find(|opt| opt.config_id.as_str() == "mode")
+            .expect("mode config option");
+        let ConfigKind::Select(sel) = &mode_opt.kind else {
+            panic!("expected select mode option");
+        };
+        assert_eq!(sel.current_value.as_str(), "auto");
+        let SelectOptions::Ungrouped(choices) = &sel.options else {
+            panic!("expected ungrouped mode options");
+        };
+        let ids: Vec<&str> = choices.iter().map(|c| c.value.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "read-only",
+                "workspace-write",
+                "agent",
+                "auto",
+                "dont-ask",
+                "agent-full-access",
+            ]
+        );
+    }
 }

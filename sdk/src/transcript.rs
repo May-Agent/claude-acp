@@ -2,10 +2,12 @@
 //! Code session transcripts (`~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`).
 
 use std::cmp::Reverse;
+use std::fmt;
 use std::future::{Future, poll_fn};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::Poll;
 
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -24,6 +26,167 @@ const MAX_CONCURRENT_TRANSCRIPT_READS: usize = 16;
 /// Maximum character length when deriving a fallback session title from the
 /// first user prompt.
 const MAX_PROMPT_TITLE_CHARS: usize = 120;
+
+/// Return the directory where Claude Code stores subagent transcripts for
+/// `session_id` (`<home>/.claude/projects/<encoded-cwd>/<session-id>/subagents`).
+#[must_use]
+pub fn subagents_dir(home: &Path, cwd: &Path, session_id: &str) -> PathBuf {
+    home.join(".claude")
+        .join("projects")
+        .join(encode_project_dir(cwd))
+        .join(session_id)
+        .join("subagents")
+}
+
+/// Pluggable lifecycle hook for synchronizing persisted Claude Code session
+/// transcripts (main `<session-id>.jsonl` and `subagents/agent-*.jsonl` files)
+/// between local disk and remote storage.
+///
+/// Hosts running on ephemeral machines can implement this trait to pull
+/// persisted transcripts before `session/resume` or `session/load` inspects
+/// local disk and push updates after each completed turn and during session
+/// shutdown.
+///
+/// The default [`NoopTranscriptSync`] performs no I/O so local-only setups
+/// remain unchanged.
+pub trait TranscriptSync: Send + Sync + 'static {
+    /// Pull persisted transcript files for `session_id` (and any associated
+    /// subagent transcripts) into `<home>/.claude/projects/<encoded-cwd>/`
+    /// before local replay or resume.
+    fn pull(
+        &self,
+        session_id: &str,
+        cwd: &Path,
+        home: &Path,
+    ) -> impl Future<Output = Result<()>> + Send;
+
+    /// Push local transcript files for `session_id` (and any associated
+    /// subagent transcripts) from `<home>/.claude/projects/<encoded-cwd>/` to
+    /// remote storage after turn completion or session shutdown.
+    fn push(
+        &self,
+        session_id: &str,
+        cwd: &Path,
+        home: &Path,
+    ) -> impl Future<Output = Result<()>> + Send;
+}
+
+/// Default [`TranscriptSync`] performing no remote I/O.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoopTranscriptSync;
+
+impl TranscriptSync for NoopTranscriptSync {
+    fn pull(
+        &self,
+        _session_id: &str,
+        _cwd: &Path,
+        _home: &Path,
+    ) -> impl Future<Output = Result<()>> + Send {
+        std::future::ready(Ok(()))
+    }
+
+    fn push(
+        &self,
+        _session_id: &str,
+        _cwd: &Path,
+        _home: &Path,
+    ) -> impl Future<Output = Result<()>> + Send {
+        std::future::ready(Ok(()))
+    }
+}
+
+trait TranscriptSyncImpl: Send + Sync + 'static {
+    fn pull_dyn<'a>(
+        &'a self,
+        session_id: &'a str,
+        cwd: &'a Path,
+        home: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
+
+    fn push_dyn<'a>(
+        &'a self,
+        session_id: &'a str,
+        cwd: &'a Path,
+        home: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
+}
+
+impl<S: TranscriptSync> TranscriptSyncImpl for S {
+    fn pull_dyn<'a>(
+        &'a self,
+        session_id: &'a str,
+        cwd: &'a Path,
+        home: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(self.pull(session_id, cwd, home))
+    }
+
+    fn push_dyn<'a>(
+        &'a self,
+        session_id: &'a str,
+        cwd: &'a Path,
+        home: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(self.push(session_id, cwd, home))
+    }
+}
+
+/// Type-erased wrapper around any [`TranscriptSync`] keeping `Pin<Box<dyn Future>>`
+/// strictly internal.
+#[derive(Clone)]
+pub struct AnyTranscriptSync {
+    inner: Arc<dyn TranscriptSyncImpl>,
+}
+
+impl Default for AnyTranscriptSync {
+    fn default() -> Self {
+        Self::new(NoopTranscriptSync)
+    }
+}
+
+impl fmt::Debug for AnyTranscriptSync {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AnyTranscriptSync").finish_non_exhaustive()
+    }
+}
+
+impl AnyTranscriptSync {
+    /// Erase the concrete type of `sync` behind [`AnyTranscriptSync`].
+    #[must_use]
+    pub fn new<S: TranscriptSync>(sync: S) -> Self {
+        Self {
+            inner: Arc::new(sync),
+        }
+    }
+}
+
+impl TranscriptSync for AnyTranscriptSync {
+    fn pull(
+        &self,
+        session_id: &str,
+        cwd: &Path,
+        home: &Path,
+    ) -> impl Future<Output = Result<()>> + Send {
+        let inner = Arc::clone(&self.inner);
+        let session_id = session_id.to_owned();
+        let cwd = cwd.to_path_buf();
+        let home = home.to_path_buf();
+        async move { inner.pull_dyn(&session_id, &cwd, &home).await }
+    }
+
+    fn push(
+        &self,
+        session_id: &str,
+        cwd: &Path,
+        home: &Path,
+    ) -> impl Future<Output = Result<()>> + Send {
+        let inner = Arc::clone(&self.inner);
+        let session_id = session_id.to_owned();
+        let cwd = cwd.to_path_buf();
+        let home = home.to_path_buf();
+        async move { inner.push_dyn(&session_id, &cwd, &home).await }
+    }
+}
 
 /// Handle to a Claude Code transcript store rooted at `<home>/.claude/projects`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -873,6 +1036,114 @@ mod tests {
         assert!(matches!(
             store.load_transcript("../outside", None).await,
             Err(SdkError::Protocol(_))
+        ));
+    }
+
+    struct SyncCall {
+        op: &'static str,
+        session_id: String,
+        cwd: PathBuf,
+        home: PathBuf,
+    }
+
+    struct RecordingSync {
+        calls: Arc<std::sync::Mutex<Vec<SyncCall>>>,
+        fail_pull: bool,
+        fail_push: bool,
+    }
+
+    impl TranscriptSync for RecordingSync {
+        fn pull(
+            &self,
+            session_id: &str,
+            cwd: &Path,
+            home: &Path,
+        ) -> impl Future<Output = Result<()>> + Send {
+            self.calls.lock().unwrap().push(SyncCall {
+                op: "pull",
+                session_id: session_id.to_string(),
+                cwd: cwd.to_path_buf(),
+                home: home.to_path_buf(),
+            });
+            let res = if self.fail_pull {
+                Err(SdkError::Protocol("remote pull failed".to_string()))
+            } else {
+                Ok(())
+            };
+            std::future::ready(res)
+        }
+
+        fn push(
+            &self,
+            session_id: &str,
+            cwd: &Path,
+            home: &Path,
+        ) -> impl Future<Output = Result<()>> + Send {
+            self.calls.lock().unwrap().push(SyncCall {
+                op: "push",
+                session_id: session_id.to_string(),
+                cwd: cwd.to_path_buf(),
+                home: home.to_path_buf(),
+            });
+            let res = if self.fail_push {
+                Err(SdkError::Protocol("remote push failed".to_string()))
+            } else {
+                Ok(())
+            };
+            std::future::ready(res)
+        }
+    }
+
+    #[tokio::test]
+    async fn transcript_sync_noop_any_wrapper_and_subagents_dir() {
+        let cwd = Path::new("/work/app");
+        let home = Path::new("/tmp/home");
+        let sid = "55555555-5555-4555-8555-555555555555";
+
+        assert_eq!(
+            subagents_dir(home, cwd, sid),
+            home.join(".claude")
+                .join("projects")
+                .join(encode_project_dir(cwd))
+                .join(sid)
+                .join("subagents")
+        );
+
+        let noop = AnyTranscriptSync::default();
+        noop.pull(sid, cwd, home).await.unwrap();
+        noop.push(sid, cwd, home).await.unwrap();
+
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ok_sync = AnyTranscriptSync::new(RecordingSync {
+            calls: Arc::clone(&calls),
+            fail_pull: false,
+            fail_push: false,
+        });
+        ok_sync.pull(sid, cwd, home).await.unwrap();
+        ok_sync.push(sid, cwd, home).await.unwrap();
+
+        {
+            let recorded = calls.lock().unwrap();
+            assert_eq!(recorded.len(), 2);
+            assert_eq!(recorded[0].op, "pull");
+            assert_eq!(recorded[0].session_id, sid);
+            assert_eq!(recorded[0].cwd, cwd);
+            assert_eq!(recorded[0].home, home);
+            assert_eq!(recorded[1].op, "push");
+        }
+
+        let failing_sync = AnyTranscriptSync::new(RecordingSync {
+            calls: Arc::new(std::sync::Mutex::new(Vec::new())),
+            fail_pull: true,
+            fail_push: true,
+        });
+        assert!(matches!(
+            failing_sync.pull(sid, cwd, home).await,
+            Err(SdkError::Protocol(msg)) if msg == "remote pull failed"
+        ));
+        assert!(matches!(
+            failing_sync.push(sid, cwd, home).await,
+            Err(SdkError::Protocol(msg)) if msg == "remote push failed"
         ));
     }
 }

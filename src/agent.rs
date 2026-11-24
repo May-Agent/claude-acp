@@ -9,16 +9,18 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use aither_acp::domain::{
-    AgentCapabilities, EmptyObject, McpCaps, PromptCaps, SessionCaps, SessionId, SessionInfo,
-    SessionListParams, SessionPage, SessionSetupParams,
+    AgentCapabilities, EmptyObject, ExtMethod, McpCaps, PromptCaps, SessionCaps, SessionId,
+    SessionInfo, SessionListParams, SessionPage, SessionSetupParams,
 };
 use aither_acp::rpc::{Peer, RpcError};
-use aither_acp::server::{AuthRequest, ResumeRequest, ServerError, SessionContext, SessionHost};
+use aither_acp::server::{
+    AuthConfig, AuthRequest, ResumeRequest, Server, ServerError, SessionContext, SessionHost,
+};
 use chrono::{DateTime, Utc};
 use claude_acp_sdk::{
-    AnyControlHandler, SdkError, SpawnConfig, TranscriptStore, find_transcript_path,
+    AnyControlHandler, SdkError, SpawnConfig, TranscriptStore, TranscriptSync, find_transcript_path,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::auth::{AuthState, apply_auth_capabilities, build_auth_methods, notify_auth_status};
@@ -30,6 +32,18 @@ use crate::mode::{AcpMode, ReasoningSetting};
 use crate::permission::{PermissionMemory, SessionControlHandler};
 use crate::session::{ClaudeSession, ClaudeSessionHandle};
 
+/// ACP extension method querying MCP server status for a live session.
+pub const EXT_MCP_STATUS: &str = "_claude/mcp_status";
+
+/// ACP extension method querying context-window usage for a live session.
+pub const EXT_CONTEXT_USAGE: &str = "_claude/context_usage";
+
+/// ACP extension method querying the latest observed rate-limit snapshot for a live session.
+pub const EXT_RATE_LIMITS: &str = "_claude/rate_limits";
+
+/// ACP extension notification emitted whenever the Claude CLI reports a rate-limit event.
+pub const NOTIFY_RATE_LIMIT: &str = "_claude/rate_limit";
+
 pub struct AgentInner {
     pub(crate) config: ClaudeAcpConfig,
     pub(crate) auth: Mutex<AuthState>,
@@ -37,6 +51,15 @@ pub struct AgentInner {
     /// Connection-level JSON-RPC peer (set by `serve` once the transport is up)
     /// used for `_auth/status_update` and other non-session notifications.
     pub(crate) peer: Mutex<Option<Peer>>,
+}
+
+impl AgentInner {
+    pub(crate) fn resolve_transcript_store(&self) -> Result<TranscriptStore> {
+        if let Some(home) = &self.config.transcript_home {
+            return Ok(TranscriptStore::new(home));
+        }
+        TranscriptStore::from_env().map_err(ClaudeAcpError::from)
+    }
 }
 
 impl fmt::Debug for AgentInner {
@@ -141,11 +164,85 @@ impl ClaudeAgent {
         }
     }
 
-    fn resolve_transcript_store(&self) -> Result<TranscriptStore> {
-        if let Some(home) = &self.inner.config.transcript_home {
-            return Ok(TranscriptStore::new(home));
+    /// Build a configured [`aither_acp::Server`] wrapping this host with its
+    /// auth and `_`-prefixed extension handlers (`_claude/mcp_status`,
+    /// `_claude/context_usage`, `_claude/rate_limits`).
+    #[must_use]
+    pub fn into_server(self) -> Server {
+        let agent_info = self.inner.config.agent_info.clone();
+        let auth_agent = self.clone();
+        let ext_agent = self.clone();
+
+        Server::builder(self.clone(), agent_info)
+            .auth(AuthConfig::new(self.auth_methods(), move |request| {
+                let agent = auth_agent.clone();
+                async move {
+                    agent
+                        .handle_auth_request(request)
+                        .await
+                        .map_err(ClaudeAcpError::into_rpc_error)
+                }
+            }))
+            .ext(move |method, params| {
+                let agent = ext_agent.clone();
+                async move {
+                    agent
+                        .handle_ext(&method, params)
+                        .await
+                        .map_err(ClaudeAcpError::into_rpc_error)
+                }
+            })
+            .build()
+    }
+
+    /// Handle `_`-prefixed extension methods (`_claude/mcp_status`,
+    /// `_claude/context_usage`, `_claude/rate_limits`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClaudeAcpError::InvalidParams`] if `sessionId` is missing or
+    /// empty, [`ClaudeAcpError::SessionNotFound`] if the session is not live,
+    /// [`ClaudeAcpError::Sdk`] if the CLI control request fails, or a
+    /// method-not-found RPC error for unrecognized extension methods.
+    pub async fn handle_ext(&self, method: &ExtMethod, params: Option<Value>) -> Result<Value> {
+        match method.as_str() {
+            EXT_MCP_STATUS => {
+                let session = self.require_live_session(params.as_ref())?;
+                let status = session.mcp_status().await?;
+                serde_json::to_value(status)
+                    .map_err(|err| ClaudeAcpError::Sdk(SdkError::json("mcp_status", err)))
+            }
+            EXT_CONTEXT_USAGE => {
+                let session = self.require_live_session(params.as_ref())?;
+                let usage = session.context_usage().await?;
+                serde_json::to_value(usage)
+                    .map_err(|err| ClaudeAcpError::Sdk(SdkError::json("context_usage", err)))
+            }
+            EXT_RATE_LIMITS => {
+                let session = self.require_live_session(params.as_ref())?;
+                Ok(session.rate_limits_json())
+            }
+            _ => Err(ClaudeAcpError::Server(ServerError::Rpc(
+                RpcError::method_not_found(method.as_str()),
+            ))),
         }
-        TranscriptStore::from_env().map_err(ClaudeAcpError::from)
+    }
+
+    fn require_live_session(&self, params: Option<&Value>) -> Result<ClaudeSessionHandle> {
+        let params = params
+            .ok_or_else(|| ClaudeAcpError::InvalidParams("missing extension params".to_string()))?;
+        let session_id = params
+            .get("sessionId")
+            .or_else(|| params.get("session_id"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| ClaudeAcpError::InvalidParams("missing `sessionId`".to_string()))?;
+        self.get_live_session(session_id)
+            .ok_or_else(|| ClaudeAcpError::SessionNotFound(session_id.to_string()))
+    }
+
+    fn resolve_transcript_store(&self) -> Result<TranscriptStore> {
+        self.inner.resolve_transcript_store()
     }
 
     fn resolve_initial_mode(&self) -> Result<AcpMode> {
@@ -209,8 +306,8 @@ impl ClaudeAgent {
         }
 
         let converted_mcp = convert_mcp_servers(mcp_servers);
-        let mcp_names: Vec<String> = converted_mcp.keys().cloned().collect();
         spawn_cfg.mcp_servers.extend(converted_mcp);
+        let mcp_names: Vec<String> = spawn_cfg.mcp_servers.keys().cloned().collect();
 
         {
             let auth = self.inner.auth.lock().expect("auth mutex poisoned");
@@ -359,7 +456,21 @@ impl SessionHost for ClaudeAgent {
             let params = req.params;
             let session_id = params.session_id.clone();
             validate_absolute_cwd(&params.setup.cwd)?;
+            validate_session_id(session_id.as_str())?;
             let store = self.resolve_transcript_store()?;
+
+            if let Err(err) = self
+                .inner
+                .config
+                .transcript_sync
+                .pull(session_id.as_str(), &params.setup.cwd, store.home())
+                .await
+            {
+                return match err {
+                    SdkError::Protocol(msg) => Err(ClaudeAcpError::InvalidParams(msg)),
+                    other => Err(ClaudeAcpError::Sdk(other)),
+                };
+            }
 
             let want_replay = params.replay_from.is_some();
 
@@ -565,6 +676,21 @@ fn validate_absolute_cwd(cwd: &Path) -> Result<()> {
         return Err(ClaudeAcpError::InvalidParams(format!(
             "`cwd` must be an absolute path, got `{}`",
             cwd.display()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_session_id(session_id: &str) -> Result<()> {
+    if session_id.is_empty()
+        || session_id == "."
+        || session_id == ".."
+        || session_id.contains('/')
+        || session_id.contains('\\')
+        || session_id.contains('\0')
+    {
+        return Err(ClaudeAcpError::InvalidParams(format!(
+            "invalid session_id `{session_id}`"
         )));
     }
     Ok(())

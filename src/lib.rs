@@ -45,11 +45,13 @@ use std::future::Future;
 
 pub use aither_acp as acp;
 use aither_acp::rpc::Peer;
-use aither_acp::server::{AuthConfig, AuthRequest, Server};
 pub use claude_acp_sdk as sdk;
 
-pub use agent::ClaudeAgent;
+pub use agent::{
+    ClaudeAgent, EXT_CONTEXT_USAGE, EXT_MCP_STATUS, EXT_RATE_LIMITS, NOTIFY_RATE_LIMIT,
+};
 pub use auth::{AUTH_METHOD_API_KEY, AUTH_METHOD_CLAUDE_LOGIN};
+pub use claude_acp_sdk::{AnyTranscriptSync, NoopTranscriptSync, TranscriptSync};
 #[cfg(feature = "process")]
 pub use config::ProcessSessionConnector;
 pub use config::{ClaudeAcpConfig, ConnectedSession, SessionConnector};
@@ -67,23 +69,8 @@ pub fn serve<T>(transport: T, config: ClaudeAcpConfig) -> (Peer, impl Future<Out
 where
     T: aither_acp::Transport + 'static,
 {
-    let agent_info = config.agent_info.clone();
     let agent = ClaudeAgent::new(config);
-    let auth = AuthConfig::new(agent.auth_methods(), {
-        let agent = agent.clone();
-        move |request: AuthRequest| {
-            let agent = agent.clone();
-            async move {
-                agent
-                    .handle_auth_request(request)
-                    .await
-                    .map_err(ClaudeAcpError::into_rpc_error)
-            }
-        }
-    });
-    let server = Server::builder(agent.clone(), agent_info)
-        .auth(auth)
-        .build();
+    let server = agent.clone().into_server();
     let (peer, connection) = server.serve(transport);
     agent.set_peer(peer.clone());
     (peer, connection)
@@ -92,23 +79,8 @@ where
 /// Serve a [`ClaudeAgent`] configured with `config` over standard input and
 /// output.
 pub fn serve_stdio(config: ClaudeAcpConfig) -> (Peer, impl Future<Output = ()> + Send) {
-    let agent_info = config.agent_info.clone();
     let agent = ClaudeAgent::new(config);
-    let auth = AuthConfig::new(agent.auth_methods(), {
-        let agent = agent.clone();
-        move |request: AuthRequest| {
-            let agent = agent.clone();
-            async move {
-                agent
-                    .handle_auth_request(request)
-                    .await
-                    .map_err(ClaudeAcpError::into_rpc_error)
-            }
-        }
-    });
-    let server = Server::builder(agent.clone(), agent_info)
-        .auth(auth)
-        .build();
+    let server = agent.clone().into_server();
     let (peer, connection) = server.serve_stdio();
     agent.set_peer(peer.clone());
     (peer, connection)

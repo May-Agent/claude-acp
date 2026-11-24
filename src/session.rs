@@ -19,13 +19,14 @@ use aither_acp::server::{
 use aither_acp::{ConfigId, PlanId, SessionId, ToolCallId};
 use chrono::{DateTime, SecondsFormat, Utc};
 use claude_acp_sdk::{
-    Client, CommandInfo, ContentBlock as SdkContentBlock, EffortLevel, InitializeResponse,
-    ResultMessage, ResultSubtype, SdkError, SessionEvent, StreamDelta, TextBlock,
-    ToolProgressMessage, claude_codes::StopReason as ClaudeStopReason,
+    Client, CommandInfo, ContentBlock as SdkContentBlock, ContextUsageResponse, EffortLevel,
+    InitializeResponse, McpStatusResponse, RateLimitEvent, RateLimitInfo, ResultMessage,
+    ResultSubtype, SdkError, SessionEvent, StreamDelta, TextBlock, ToolProgressMessage,
+    TranscriptSync, claude_codes::StopReason as ClaudeStopReason,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 
-use crate::agent::AgentInner;
+use crate::agent::{AgentInner, NOTIFY_RATE_LIMIT};
 use crate::auth::{AuthState, notify_auth_status_cx};
 use crate::convert::{
     build_tool_call, build_tool_input_update, build_tool_result_update, convert_prompt_blocks,
@@ -51,6 +52,8 @@ pub struct SessionMetadata {
     pub(crate) cli_commands: Vec<CommandInfo>,
     pub(crate) title: Option<String>,
     pub(crate) updated_at: String,
+    pub(crate) latest_rate_limit: Option<RateLimitEvent>,
+    pub(crate) rate_limit_windows: BTreeMap<String, RateLimitInfo>,
 }
 
 /// State of an active SDK-backed ACP session.
@@ -66,6 +69,7 @@ pub struct ClaudeSession {
     pub(crate) meta: Mutex<SessionMetadata>,
     pub(crate) permission_memory: Arc<PermissionMemory>,
     pub(crate) turn_cancelled: Arc<AtomicBool>,
+    pub(crate) shutdown_started: AtomicBool,
     pub(crate) agent: Weak<AgentInner>,
 }
 
@@ -103,9 +107,12 @@ impl ClaudeSession {
                 cli_commands: init_response.commands,
                 title: initial_title,
                 updated_at: now_rfc3339(),
+                latest_rate_limit: None,
+                rate_limit_windows: BTreeMap::new(),
             }),
             permission_memory,
             turn_cancelled,
+            shutdown_started: AtomicBool::new(false),
             agent,
         }
     }
@@ -190,11 +197,74 @@ impl ClaudeSession {
         )
     }
 
-    /// Shut down the SDK client and drive its transport/process future to exit.
+    /// Query MCP server connection and tool status for this session.
+    pub(crate) async fn mcp_status(&self) -> Result<McpStatusResponse> {
+        self.driver
+            .drive_until(self.client.mcp_status())
+            .await
+            .map_err(ClaudeAcpError::from)
+    }
+
+    /// Query structured context-window usage for this session.
+    pub(crate) async fn context_usage(&self) -> Result<ContextUsageResponse> {
+        self.driver
+            .drive_until(self.client.context_usage())
+            .await
+            .map_err(ClaudeAcpError::from)
+    }
+
+    /// Snapshot the latest observed rate-limit event and per-window readings as JSON.
+    pub(crate) fn rate_limits_json(&self) -> Value {
+        let meta = self.meta.lock().expect("session metadata mutex poisoned");
+        json!({
+            "sessionId": self.session_id.as_str(),
+            "latest": meta.latest_rate_limit,
+            "rateLimitInfo": meta.latest_rate_limit.as_ref().map(|ev| &ev.rate_limit_info),
+            "windows": meta.rate_limit_windows,
+        })
+    }
+
+    async fn push_transcript(&self) {
+        let Some(agent) = self.agent.upgrade() else {
+            return;
+        };
+        let store = match agent.resolve_transcript_store() {
+            Ok(store) => store,
+            Err(err) => {
+                tracing::warn!(
+                    session_id = %self.session_id,
+                    %err,
+                    "unable to resolve transcript home for transcript push"
+                );
+                return;
+            }
+        };
+        if let Err(err) = agent
+            .config
+            .transcript_sync
+            .push(self.session_id.as_str(), &self.cwd, store.home())
+            .await
+        {
+            tracing::warn!(
+                session_id = %self.session_id,
+                cwd = %self.cwd.display(),
+                home = %store.home().display(),
+                %err,
+                "transcript push failed"
+            );
+        }
+    }
+
+    /// Shut down the SDK client and drive its transport/process future to exit,
+    /// then push local transcripts via the configured `TranscriptSync`.
     pub(crate) async fn shutdown(&self) {
+        if self.shutdown_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
         self.turn_cancelled.store(true, Ordering::SeqCst);
         self.client.close();
         self.driver.drive_to_completion().await;
+        self.push_transcript().await;
     }
 
     /// Execute one prompt turn on this session, streaming updates through
@@ -229,7 +299,7 @@ impl ClaudeSession {
                 .map_err(|e| ClaudeAcpError::Server(e.into()))?;
         }
 
-        Box::pin(self.driver.drive_until(async {
+        let stop_reason = Box::pin(self.driver.drive_until(async {
             self.client.send_user_blocks(blocks, None).await?;
             let mut streamer = TurnStreamer::new();
 
@@ -284,7 +354,10 @@ impl ClaudeSession {
                 }
             }
         }))
-        .await
+        .await?;
+
+        self.push_transcript().await;
+        Ok(stop_reason)
     }
 
     async fn handle_session_event(
@@ -345,12 +418,14 @@ impl ClaudeSession {
             SessionEvent::Other(other) => {
                 self.handle_other_output(cx, &other).await?;
             }
+            SessionEvent::RateLimit(ev) => {
+                self.handle_rate_limit(cx, ev).await?;
+            }
             SessionEvent::Result(res) => {
                 let final_stop = self.finish_turn(turn, streamer, &res).await?;
                 return Ok(Some(final_stop));
             }
             SessionEvent::ApiError(_)
-            | SessionEvent::RateLimit(_)
             | SessionEvent::CommandLifecycle(_)
             | SessionEvent::ToolUseSummary(_)
             | SessionEvent::PromptSuggestion(_) => {}
@@ -733,6 +808,25 @@ impl ClaudeSession {
             meta.updated_at.clone()
         };
         cx.set_session_info(Patch::Set(title), Patch::Set(updated_at))
+            .await
+            .map_err(into_server_err)
+    }
+
+    async fn handle_rate_limit(&self, cx: &SessionContext, ev: RateLimitEvent) -> Result<()> {
+        let payload = json!({
+            "sessionId": self.session_id.as_str(),
+            "rateLimitInfo": &ev.rate_limit_info,
+            "event": &ev,
+        });
+        {
+            let mut meta = self.meta.lock().expect("session metadata mutex poisoned");
+            if let Some(window) = &ev.rate_limit_info.rate_limit_type {
+                meta.rate_limit_windows
+                    .insert(window.as_str().to_string(), ev.rate_limit_info.clone());
+            }
+            meta.latest_rate_limit = Some(ev);
+        }
+        cx.notify(NOTIFY_RATE_LIMIT, Some(payload))
             .await
             .map_err(into_server_err)
     }
