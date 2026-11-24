@@ -10,8 +10,8 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use aither_acp::domain::{
-    AuthMethodId, CancelledOutcome, ConfigValue, ConfigValueById, ContentBlock, EnvVar, HttpHeader,
-    ImageContent, McpServer, McpServerHttp, McpServerStdio, Open, PermissionOptionKind,
+    AuthMethodId, CancelledOutcome, ConfigValue, ConfigValueById, ContentBlock, EnvVar, ExtMethod,
+    HttpHeader, ImageContent, McpServer, McpServerHttp, McpServerStdio, Open, PermissionOptionKind,
     PermissionOutcome, PermissionRequest, Plan, ResourceContents, ResourceLink, SelectedOutcome,
     TextContent, TextResourceContents, ToolCallStatus,
 };
@@ -20,9 +20,13 @@ use aither_acp::rpc::Memory;
 use aither_acp::state::MessageKind;
 use aither_acp::{Client, ClientBuilder, Implementation, SessionEvent, SessionId, TurnOutcome};
 use async_channel::{Receiver, Sender};
-use claude_acp::sdk::{NdjsonReader, NdjsonWriter, SpawnConfig, transcript_path};
+use claude_acp::sdk::{
+    NdjsonReader, NdjsonWriter, PermissionMode, SdkError, SpawnConfig, subagents_dir,
+    transcript_path,
+};
 use claude_acp::{
-    AUTH_METHOD_API_KEY, AUTH_METHOD_CLAUDE_LOGIN, ClaudeAcpConfig, ConnectedSession, serve,
+    AUTH_METHOD_API_KEY, AUTH_METHOD_CLAUDE_LOGIN, ClaudeAcpConfig, ClaudeAgent, ConnectedSession,
+    EXT_CONTEXT_USAGE, EXT_MCP_STATUS, EXT_RATE_LIMITS, NOTIFY_RATE_LIMIT, TranscriptSync, serve,
 };
 use futures_lite::io::{AsyncRead, AsyncWrite};
 use futures_lite::stream::Stream;
@@ -210,9 +214,15 @@ enum PermissionReply {
     Cancel,
 }
 
+struct RawNotification {
+    method: String,
+    params: Option<Value>,
+}
+
 #[derive(Clone)]
 struct Recording {
     auth_updates: Arc<Mutex<Vec<AuthStatus>>>,
+    notifications: Arc<Mutex<Vec<RawNotification>>>,
     permission_requests: Arc<Mutex<Vec<PermissionRequest>>>,
     permission_plan: Arc<Mutex<VecDeque<PermissionReply>>>,
 }
@@ -221,6 +231,7 @@ impl Recording {
     fn new() -> Self {
         Self {
             auth_updates: Arc::new(Mutex::new(Vec::new())),
+            notifications: Arc::new(Mutex::new(Vec::new())),
             permission_requests: Arc::new(Mutex::new(Vec::new())),
             permission_plan: Arc::new(Mutex::new(VecDeque::new())),
         }
@@ -232,6 +243,16 @@ impl Recording {
 
     fn take_auth_updates(&self) -> Vec<AuthStatus> {
         std::mem::take(&mut *self.auth_updates.lock().unwrap())
+    }
+
+    fn notifications_for(&self, method: &str) -> Vec<Value> {
+        self.notifications
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|n| n.method == method)
+            .filter_map(|n| n.params.clone())
+            .collect()
     }
 
     fn permission_request_count(&self) -> usize {
@@ -248,6 +269,10 @@ impl Recording {
                     if let Some(status) = auth_status::notification(&notification) {
                         rec.auth_updates.lock().unwrap().push(status);
                     }
+                    rec.notifications.lock().unwrap().push(RawNotification {
+                        method: notification.method,
+                        params: notification.params,
+                    });
                 }
             })
             .permissions(move |request: PermissionRequest| {
@@ -1019,4 +1044,909 @@ async fn session_list_replay_resume_and_delete() {
     );
 
     harness.shutdown().await;
+}
+
+// =============================================================================
+// 6. Auto & DontAsk permission modes + SpawnConfig extra_args/env propagation
+// =============================================================================
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn auto_and_dont_ask_modes_and_spawn_extra_args_propagate() {
+    let home = TempHome::new();
+    let recording = Recording::new();
+    let (cli_tx, cli_rx) = async_channel::unbounded();
+    let cwd = std::env::temp_dir().canonicalize().unwrap();
+
+    let resume_id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    seed_persisted_transcript(&home.path, &cwd, resume_id, "prior-session");
+
+    let spawn = SpawnConfig::new()
+        .include_partial_messages(true)
+        .extra_args(["--strict-mcp-config", "--debug", "mcp"])
+        .env_var("CLAUDE_CONFIG_DIR", "/tmp/isolated-claude")
+        .env_var("CLAUDE_CODE_PROJECT_DIR_NAME", "stable-project-key");
+
+    let config = ClaudeAcpConfig::new()
+        .spawn(spawn)
+        .default_mode("auto")
+        .transcript_home(&home.path)
+        .connector(move |spawn_config, control_handler| {
+            let cli_tx = cli_tx.clone();
+            async move {
+                let ((sdk_r, sdk_w), (reader, writer)) = mock_cli_pipe();
+                let _ = cli_tx
+                    .send(MockCliEndpoint {
+                        spawn_config,
+                        reader,
+                        writer,
+                    })
+                    .await;
+                Ok(ConnectedSession::attach(sdk_r, sdk_w, control_handler))
+            }
+        });
+
+    let (client_transport, server_transport) = Memory::pair();
+    let (_peer, server_conn) = serve(server_transport, config);
+    let server_task = tokio::spawn(server_conn);
+    let (client, client_conn) = recording
+        .build_client()
+        .connect(client_transport)
+        .await
+        .expect("ACP connect");
+    let client_task = tokio::spawn(client_conn);
+
+    // 1. New session gets `PermissionMode::Auto`, extra_args, and env vars.
+    let cli_rx_1 = cli_rx.clone();
+    let mock1 = tokio::spawn(async move {
+        let mut cli = cli_rx_1.recv().await.expect("cli endpoint 1");
+        assert_eq!(cli.spawn_config.permission_mode, Some(PermissionMode::Auto));
+        assert_eq!(
+            cli.spawn_config.extra_args,
+            vec!["--strict-mcp-config", "--debug", "mcp"]
+        );
+        assert_eq!(
+            cli.spawn_config
+                .env
+                .get("CLAUDE_CONFIG_DIR")
+                .map(String::as_str),
+            Some("/tmp/isolated-claude")
+        );
+        assert_eq!(
+            cli.spawn_config
+                .env
+                .get("CLAUDE_CODE_PROJECT_DIR_NAME")
+                .map(String::as_str),
+            Some("stable-project-key")
+        );
+        let argv = cli.spawn_config.build_args().expect("build_args");
+        assert!(argv.contains(&"--strict-mcp-config".to_string()));
+        assert!(argv.windows(2).any(|w| w == ["--permission-mode", "auto"]));
+
+        cli.ack_initialize(vec![]).await;
+
+        // Switch mode to `dont-ask` -> CLI receives `dontAsk`.
+        let mode_req = cli.recv().await;
+        assert_eq!(mode_req["request"]["subtype"], "set_permission_mode");
+        assert_eq!(mode_req["request"]["mode"], "dontAsk");
+        cli.ack_control(&mode_req["request_id"], json!({})).await;
+
+        // Prompt turn: CLI sends `can_use_tool`, which `dont-ask` must deny
+        // without prompting the ACP client; then CLI emits `system/init` with
+        // `permissionMode: "auto"` to reconcile mode back.
+        let _user = cli.recv().await;
+        cli.send(&json!({
+            "type": "control_request",
+            "request_id": "perm-dont-ask",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "Bash",
+                "input": { "command": "rm -rf /tmp/x" },
+                "permission_suggestions": []
+            }
+        }))
+        .await;
+        let deny_resp = cli.recv().await;
+        assert_eq!(deny_resp["type"], "control_response");
+        assert_eq!(deny_resp["response"]["response"]["behavior"], "deny");
+
+        cli.send(&json!({
+            "type": "system",
+            "subtype": "init",
+            "session_id": "s-auto",
+            "cwd": "/tmp",
+            "permissionMode": "auto"
+        }))
+        .await;
+        cli.send(&json!({
+            "type": "result", "subtype": "success", "is_error": false,
+            "duration_ms": 1, "duration_api_ms": 1, "num_turns": 1,
+            "session_id": "s-auto", "total_cost_usd": 0.0
+        }))
+        .await;
+    });
+
+    let session = client.new_session(&cwd).open().await.expect("session/new");
+    let mode_opt = session
+        .state()
+        .config_options
+        .into_iter()
+        .find(|o| o.config_id.as_str() == "mode")
+        .expect("mode option");
+    if let aither_acp::domain::ConfigKind::Select(sel) = mode_opt.kind {
+        assert_eq!(sel.current_value.as_str(), "auto");
+    } else {
+        panic!("expected select mode option");
+    }
+
+    session
+        .set_config(
+            aither_acp::ConfigId::from_string("mode"),
+            ConfigValue::Id(ConfigValueById {
+                value: aither_acp::domain::ConfigValueId::from_string("dont-ask"),
+            }),
+        )
+        .await
+        .expect("set_config dont-ask");
+
+    let outcome = session
+        .prompt_run(vec![text_block("check dont-ask")])
+        .await
+        .expect("prompt");
+    assert!(matches!(
+        outcome,
+        TurnOutcome::Finished {
+            stop_reason: Some(Open::Known(aither_acp::StopReason::EndTurn)),
+            error: None,
+            ..
+        }
+    ));
+    assert_eq!(recording.permission_request_count(), 0);
+    mock1.await.expect("mock1");
+
+    // `system/init` reconciled mode back to `auto`.
+    let mode_opt_after = session
+        .state()
+        .config_options
+        .into_iter()
+        .find(|o| o.config_id.as_str() == "mode")
+        .expect("mode option after init");
+    if let aither_acp::domain::ConfigKind::Select(sel) = mode_opt_after.kind {
+        assert_eq!(sel.current_value.as_str(), "auto");
+    } else {
+        panic!("expected select mode option");
+    }
+
+    // 2. Resumed session also preserves extra_args and env.
+    let cli_rx_2 = cli_rx.clone();
+    let mock2 = tokio::spawn(async move {
+        let mut cli = cli_rx_2.recv().await.expect("cli endpoint 2");
+        assert_eq!(cli.spawn_config.resume.as_deref(), Some(resume_id));
+        assert_eq!(
+            cli.spawn_config.extra_args,
+            vec!["--strict-mcp-config", "--debug", "mcp"]
+        );
+        assert_eq!(
+            cli.spawn_config
+                .env
+                .get("CLAUDE_CONFIG_DIR")
+                .map(String::as_str),
+            Some("/tmp/isolated-claude")
+        );
+        cli.ack_initialize(vec![]).await;
+    });
+
+    let resumed = client
+        .resume_session(SessionId::from_string(resume_id), &cwd)
+        .no_replay()
+        .open()
+        .await
+        .expect("resume_session");
+    mock2.await.expect("mock2");
+    resumed.close().await.expect("close resumed");
+    session.close().await.expect("close session");
+
+    client.close().await;
+    tokio::time::timeout(Duration::from_secs(5), client_task)
+        .await
+        .expect("client_task exit")
+        .expect("client_task join");
+    tokio::time::timeout(Duration::from_secs(5), server_task)
+        .await
+        .expect("server_task exit")
+        .expect("server_task join");
+}
+
+// =============================================================================
+// 7. `_claude/mcp_status`, `_claude/context_usage`, `_claude/rate_limits`,
+//    and `_claude/rate_limit` notifications via `ClaudeAgent::into_server()`
+// =============================================================================
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn extensions_and_rate_limit_notifications_over_wire_into_server() {
+    let home = TempHome::new();
+    let recording = Recording::new();
+    let (cli_tx, cli_rx) = async_channel::unbounded();
+    let cwd = std::env::temp_dir().canonicalize().unwrap();
+
+    let config = ClaudeAcpConfig::new()
+        .transcript_home(&home.path)
+        .connector(move |spawn_config, control_handler| {
+            let cli_tx = cli_tx.clone();
+            async move {
+                let ((sdk_r, sdk_w), (reader, writer)) = mock_cli_pipe();
+                let _ = cli_tx
+                    .send(MockCliEndpoint {
+                        spawn_config,
+                        reader,
+                        writer,
+                    })
+                    .await;
+                Ok(ConnectedSession::attach(sdk_r, sdk_w, control_handler))
+            }
+        });
+
+    let (client_transport, server_transport) = Memory::pair();
+    let (_peer, server_conn) = ClaudeAgent::new(config)
+        .into_server()
+        .serve(server_transport);
+    let server_task = tokio::spawn(server_conn);
+    let (client, client_conn) = recording
+        .build_client()
+        .connect(client_transport)
+        .await
+        .expect("ACP connect");
+    let client_task = tokio::spawn(client_conn);
+
+    let cli_task = tokio::spawn(async move {
+        let mut cli = cli_rx.recv().await.expect("cli endpoint");
+        cli.ack_initialize(vec![]).await;
+
+        // Turn emitting two rate-limit events across distinct windows.
+        let _user = cli.recv().await;
+        cli.send(&json!({
+            "type": "rate_limit_event",
+            "session_id": "cli-sess-1",
+            "uuid": "rl-1",
+            "rate_limit_info": {
+                "status": "allowed_warning",
+                "resetsAt": 1_750_000_000_u64,
+                "rateLimitType": "five_hour",
+                "utilization": 0.85
+            }
+        }))
+        .await;
+        cli.send(&json!({
+            "type": "rate_limit_event",
+            "session_id": "cli-sess-1",
+            "uuid": "rl-2",
+            "rate_limit_info": {
+                "status": "rejected",
+                "resetsAt": 1_750_500_000_u64,
+                "rateLimitType": "seven_day",
+                "utilization": 1.0
+            }
+        }))
+        .await;
+        cli.send(&json!({
+            "type": "result", "subtype": "success", "is_error": false,
+            "duration_ms": 12, "duration_api_ms": 10, "num_turns": 1,
+            "session_id": "cli-sess-1", "total_cost_usd": 0.001
+        }))
+        .await;
+
+        // `_claude/mcp_status` control request.
+        let mcp_req = cli.recv().await;
+        assert_eq!(mcp_req["request"]["subtype"], "mcp_status");
+        cli.ack_control(
+            &mcp_req["request_id"],
+            json!({
+                "mcpServers": [
+                    { "name": "flyco", "status": "connected", "tools": [{ "name": "budget" }] },
+                    { "name": "broken", "status": "failed", "error": "connection refused" }
+                ]
+            }),
+        )
+        .await;
+
+        // `_claude/context_usage` success.
+        let ctx_req = cli.recv().await;
+        assert_eq!(ctx_req["request"]["subtype"], "get_context_usage");
+        cli.ack_control(
+            &ctx_req["request_id"],
+            json!({
+                "model": "claude-sonnet-4-6",
+                "totalTokens": 24_000,
+                "maxTokens": 200_000,
+                "isAutoCompactEnabled": true,
+                "autoCompactThreshold": 160_000,
+                "categories": [{ "name": "Messages", "tokens": 12_000 }],
+                "mcpTools": [{ "name": "mcp__flyco__budget", "tokens": 350, "isLoaded": true }],
+                "memoryFiles": [{ "path": "AGENTS.md", "type": "Project", "tokens": 800 }],
+                "agents": [{ "agentType": "Explore", "source": "built-in", "tokens": 250 }],
+                "skills": { "skillFrontmatter": [{ "name": "deploy", "tokens": 100 }] }
+            }),
+        )
+        .await;
+
+        // `_claude/context_usage` control error path.
+        let ctx_err_req = cli.recv().await;
+        assert_eq!(ctx_err_req["request"]["subtype"], "get_context_usage");
+        cli.send(&json!({
+            "type": "control_response",
+            "response": {
+                "subtype": "error",
+                "request_id": ctx_err_req["request_id"],
+                "error": "session closed"
+            }
+        }))
+        .await;
+    });
+
+    let session = client.new_session(&cwd).open().await.expect("session/new");
+    let sid = session.id().as_str().to_string();
+
+    let ext_mcp = ExtMethod::new(EXT_MCP_STATUS);
+    let ext_ctx = ExtMethod::new(EXT_CONTEXT_USAGE);
+    let ext_rl = ExtMethod::new(EXT_RATE_LIMITS);
+    let ext_unknown = ExtMethod::new("_claude/nonexistent");
+
+    // Before any rate-limit event, `_claude/rate_limits` returns an empty snapshot.
+    let initial_rl = client
+        .ext_request(&ext_rl, &json!({ "sessionId": sid }))
+        .await
+        .expect("initial rate_limits");
+    assert_eq!(initial_rl["sessionId"], sid);
+    assert!(initial_rl["latest"].is_null());
+    assert!(initial_rl["rateLimitInfo"].is_null());
+    assert_eq!(initial_rl["windows"], json!({}));
+
+    // Run turn delivering two rate-limit events.
+    let outcome = session
+        .prompt_run(vec![text_block("check limits")])
+        .await
+        .expect("prompt");
+    assert!(matches!(
+        outcome,
+        TurnOutcome::Finished {
+            stop_reason: Some(Open::Known(aither_acp::StopReason::EndTurn)),
+            error: None,
+            ..
+        }
+    ));
+
+    // Notifications arrived for both events.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let rl_notifs = recording.notifications_for(NOTIFY_RATE_LIMIT);
+    assert_eq!(rl_notifs.len(), 2);
+    assert_eq!(rl_notifs[0]["sessionId"], sid);
+    assert_eq!(rl_notifs[0]["rateLimitInfo"]["status"], "allowed_warning");
+    assert_eq!(rl_notifs[0]["rateLimitInfo"]["rateLimitType"], "five_hour");
+    assert_eq!(rl_notifs[0]["event"]["uuid"], "rl-1");
+    assert_eq!(rl_notifs[1]["rateLimitInfo"]["status"], "rejected");
+    assert_eq!(rl_notifs[1]["rateLimitInfo"]["rateLimitType"], "seven_day");
+
+    // `_claude/rate_limits` reports latest event + both tracked windows.
+    let after_rl = client
+        .ext_request(&ext_rl, &json!({ "sessionId": sid }))
+        .await
+        .expect("after rate_limits");
+    assert_eq!(after_rl["latest"]["uuid"], "rl-2");
+    assert_eq!(after_rl["rateLimitInfo"]["status"], "rejected");
+    assert_eq!(after_rl["windows"]["five_hour"]["utilization"], 0.85);
+    assert_eq!(after_rl["windows"]["seven_day"]["status"], "rejected");
+
+    // `_claude/mcp_status`.
+    let mcp = client
+        .ext_request(&ext_mcp, &json!({ "sessionId": sid }))
+        .await
+        .expect("mcp_status");
+    assert_eq!(mcp["mcpServers"].as_array().unwrap().len(), 2);
+    assert_eq!(mcp["mcpServers"][0]["name"], "flyco");
+    assert_eq!(mcp["mcpServers"][1]["status"], "failed");
+
+    // `_claude/context_usage` success.
+    let ctx = client
+        .ext_request(&ext_ctx, &json!({ "sessionId": sid }))
+        .await
+        .expect("context_usage");
+    assert_eq!(ctx["model"], "claude-sonnet-4-6");
+    assert_eq!(ctx["totalTokens"], 24_000);
+    assert_eq!(ctx["maxTokens"], 200_000);
+    assert_eq!(ctx["autoCompactThreshold"], 160_000);
+    assert_eq!(ctx["mcpTools"][0]["name"], "mcp__flyco__budget");
+
+    // `_claude/context_usage` control error propagates as RPC error.
+    assert!(
+        client
+            .ext_request(&ext_ctx, &json!({ "sessionId": sid }))
+            .await
+            .is_err()
+    );
+
+    // Parameter validation, unknown session, and unknown method errors.
+    assert!(client.ext_request(&ext_mcp, &json!({})).await.is_err());
+    assert!(
+        client
+            .ext_request(&ext_mcp, &json!({ "sessionId": "does-not-exist" }))
+            .await
+            .is_err()
+    );
+    assert!(
+        client
+            .ext_request(&ext_unknown, &json!({ "sessionId": sid }))
+            .await
+            .is_err()
+    );
+
+    cli_task.await.expect("cli task");
+    session.close().await.expect("close session");
+    client.close().await;
+    tokio::time::timeout(Duration::from_secs(5), client_task)
+        .await
+        .expect("client_task exit")
+        .expect("client_task join");
+    tokio::time::timeout(Duration::from_secs(5), server_task)
+        .await
+        .expect("server_task exit")
+        .expect("server_task join");
+}
+
+// =============================================================================
+// 8. In-process `aither-acp` lane + `into_server()` direct core dispatch
+// =============================================================================
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn in_process_host_notifications_and_into_server_extensions() {
+    let home = TempHome::new();
+    let recording = Recording::new();
+    let (cli_tx, cli_rx) = async_channel::unbounded();
+    let cwd = std::env::temp_dir().canonicalize().unwrap();
+
+    let config = ClaudeAcpConfig::new()
+        .default_mode("auto")
+        .transcript_home(&home.path)
+        .connector(move |spawn_config, control_handler| {
+            let cli_tx = cli_tx.clone();
+            async move {
+                let ((sdk_r, sdk_w), (reader, writer)) = mock_cli_pipe();
+                let _ = cli_tx
+                    .send(MockCliEndpoint {
+                        spawn_config,
+                        reader,
+                        writer,
+                    })
+                    .await;
+                Ok(ConnectedSession::attach(sdk_r, sdk_w, control_handler))
+            }
+        });
+
+    let agent = ClaudeAgent::new(config);
+    let server = agent.clone().into_server();
+
+    let (client, conn) = recording
+        .build_client()
+        .in_process(agent)
+        .await
+        .expect("in_process connect");
+    let conn_task = tokio::spawn(conn);
+
+    let cli_task = tokio::spawn(async move {
+        let mut cli = cli_rx.recv().await.expect("cli endpoint");
+        assert_eq!(cli.spawn_config.permission_mode, Some(PermissionMode::Auto));
+        cli.ack_initialize(vec![]).await;
+
+        let _user = cli.recv().await;
+        cli.send(&json!({
+            "type": "rate_limit_event",
+            "session_id": "inproc-1",
+            "rate_limit_info": {
+                "status": "allowed_warning",
+                "resetsAt": 1_760_000_000_u64,
+                "rateLimitType": "five_hour",
+                "utilization": 0.91
+            }
+        }))
+        .await;
+        cli.send(&json!({
+            "type": "result", "subtype": "success", "is_error": false,
+            "duration_ms": 5, "duration_api_ms": 4, "num_turns": 1,
+            "session_id": "inproc-1", "total_cost_usd": 0.0
+        }))
+        .await;
+
+        let mcp_req = cli.recv().await;
+        assert_eq!(mcp_req["request"]["subtype"], "mcp_status");
+        cli.ack_control(
+            &mcp_req["request_id"],
+            json!({ "mcpServers": [{ "name": "inproc-mcp", "status": "connected" }] }),
+        )
+        .await;
+
+        let ctx_req = cli.recv().await;
+        assert_eq!(ctx_req["request"]["subtype"], "get_context_usage");
+        cli.ack_control(
+            &ctx_req["request_id"],
+            json!({ "model": "claude-opus-4-6", "totalTokens": 512, "maxTokens": 200_000 }),
+        )
+        .await;
+    });
+
+    let session = client.new_session(&cwd).open().await.expect("session/new");
+    let sid = session.id().as_str().to_string();
+
+    let outcome = session
+        .prompt_run(vec![text_block("in-process turn")])
+        .await
+        .expect("prompt");
+    assert!(matches!(
+        outcome,
+        TurnOutcome::Finished {
+            stop_reason: Some(Open::Known(aither_acp::StopReason::EndTurn)),
+            error: None,
+            ..
+        }
+    ));
+
+    // `_claude/rate_limit` notification delivered over direct in-process lane.
+    let rl_notifs = recording.notifications_for(NOTIFY_RATE_LIMIT);
+    assert_eq!(rl_notifs.len(), 1);
+    assert_eq!(rl_notifs[0]["sessionId"], sid);
+    assert_eq!(rl_notifs[0]["rateLimitInfo"]["utilization"], 0.91);
+
+    // `into_server().core()` dispatches `_claude/*` extensions against the shared agent.
+    let mcp = server
+        .core()
+        .ext_request(EXT_MCP_STATUS, Some(json!({ "sessionId": sid })))
+        .await
+        .expect("core mcp_status");
+    assert_eq!(mcp["mcpServers"][0]["name"], "inproc-mcp");
+
+    let ctx = server
+        .core()
+        .ext_request(EXT_CONTEXT_USAGE, Some(json!({ "sessionId": sid })))
+        .await
+        .expect("core context_usage");
+    assert_eq!(ctx["model"], "claude-opus-4-6");
+    assert_eq!(ctx["totalTokens"], 512);
+
+    let rl = server
+        .core()
+        .ext_request(EXT_RATE_LIMITS, Some(json!({ "sessionId": sid })))
+        .await
+        .expect("core rate_limits");
+    assert_eq!(rl["windows"]["five_hour"]["utilization"], 0.91);
+
+    cli_task.await.expect("cli task");
+    session.close().await.expect("close session");
+    client.close().await;
+    tokio::time::timeout(Duration::from_secs(5), conn_task)
+        .await
+        .expect("conn exit")
+        .expect("conn join");
+}
+
+// =============================================================================
+// 9. `TranscriptSync` lifecycle (`pull` before resume/load, `push` after turns
+//    and shutdown, plus failure paths)
+// =============================================================================
+
+struct SyncRecord {
+    op: &'static str,
+    session_id: String,
+    cwd: PathBuf,
+    home: PathBuf,
+}
+
+#[derive(Clone)]
+struct MockTranscriptSync {
+    events: Arc<Mutex<Vec<SyncRecord>>>,
+    seed_on_pull: bool,
+    fail_pull: bool,
+    fail_push: bool,
+}
+
+impl TranscriptSync for MockTranscriptSync {
+    fn pull(
+        &self,
+        session_id: &str,
+        cwd: &Path,
+        home: &Path,
+    ) -> impl std::future::Future<Output = claude_acp::sdk::Result<()>> + Send {
+        self.events.lock().unwrap().push(SyncRecord {
+            op: "pull",
+            session_id: session_id.to_string(),
+            cwd: cwd.to_path_buf(),
+            home: home.to_path_buf(),
+        });
+        if self.fail_pull {
+            return std::future::ready(Err(SdkError::Protocol(
+                "remote bucket unavailable".to_string(),
+            )));
+        }
+        if self.seed_on_pull {
+            seed_persisted_transcript(home, cwd, session_id, "remote-pulled-title");
+            let subagent_file = subagents_dir(home, cwd, session_id).join("agent-1.jsonl");
+            write_transcript_jsonl(
+                &subagent_file,
+                &[json!({
+                    "type": "user",
+                    "sessionId": session_id,
+                    "isSidechain": true,
+                    "cwd": cwd,
+                    "message": { "role": "user", "content": "subagent task" }
+                })],
+            );
+        }
+        std::future::ready(Ok(()))
+    }
+
+    fn push(
+        &self,
+        session_id: &str,
+        cwd: &Path,
+        home: &Path,
+    ) -> impl std::future::Future<Output = claude_acp::sdk::Result<()>> + Send {
+        self.events.lock().unwrap().push(SyncRecord {
+            op: "push",
+            session_id: session_id.to_string(),
+            cwd: cwd.to_path_buf(),
+            home: home.to_path_buf(),
+        });
+        let res = if self.fail_push {
+            Err(SdkError::Protocol("remote upload failed".to_string()))
+        } else {
+            Ok(())
+        };
+        std::future::ready(res)
+    }
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn transcript_sync_pulls_before_resume_and_pushes_after_turns_and_shutdown() {
+    let home = TempHome::new();
+    let recording = Recording::new();
+    let (cli_tx, cli_rx) = async_channel::unbounded();
+    let cwd = std::env::temp_dir().canonicalize().unwrap();
+    let sync_events = Arc::new(Mutex::new(Vec::new()));
+
+    let sync = MockTranscriptSync {
+        events: Arc::clone(&sync_events),
+        seed_on_pull: true,
+        fail_pull: false,
+        fail_push: false,
+    };
+
+    let config = ClaudeAcpConfig::new()
+        .transcript_home(&home.path)
+        .transcript_sync(sync)
+        .connector(move |spawn_config, control_handler| {
+            let cli_tx = cli_tx.clone();
+            async move {
+                let ((sdk_r, sdk_w), (reader, writer)) = mock_cli_pipe();
+                let _ = cli_tx
+                    .send(MockCliEndpoint {
+                        spawn_config,
+                        reader,
+                        writer,
+                    })
+                    .await;
+                Ok(ConnectedSession::attach(sdk_r, sdk_w, control_handler))
+            }
+        });
+
+    let (client_transport, server_transport) = Memory::pair();
+    let (_peer, server_conn) = serve(server_transport, config);
+    let server_task = tokio::spawn(server_conn);
+    let (client, client_conn) = recording
+        .build_client()
+        .connect(client_transport)
+        .await
+        .expect("ACP connect");
+    let client_task = tokio::spawn(client_conn);
+
+    let remote_id = "99999999-8888-4777-8666-555555555555";
+    assert!(!transcript_path(&home.path, &cwd, remote_id).exists());
+
+    let cli_task = tokio::spawn(async move {
+        let mut cli = cli_rx.recv().await.expect("cli endpoint");
+        assert_eq!(cli.spawn_config.resume.as_deref(), Some(remote_id));
+        cli.ack_initialize(vec![]).await;
+
+        let _user = cli.recv().await;
+        cli.send(&json!({
+            "type": "assistant",
+            "session_id": remote_id,
+            "message": {
+                "id": "m-sync",
+                "role": "assistant",
+                "model": "claude-sonnet-4-6",
+                "content": [{ "type": "text", "text": "synced ok" }]
+            }
+        }))
+        .await;
+        cli.send(&json!({
+            "type": "result", "subtype": "success", "is_error": false,
+            "duration_ms": 5, "duration_api_ms": 4, "num_turns": 1,
+            "session_id": remote_id, "total_cost_usd": 0.0
+        }))
+        .await;
+    });
+
+    // `session/load` (replay resume): `pull` materializes main + subagent files before replay.
+    let resumed = client
+        .resume_session(SessionId::from_string(remote_id), &cwd)
+        .open()
+        .await
+        .expect("resume after pull");
+
+    let msgs_json = format!("{:?}", resumed.state().messages);
+    assert!(
+        msgs_json.contains("remote-pulled-title"),
+        "expected pulled transcript to replay: {msgs_json}"
+    );
+    assert!(
+        subagents_dir(&home.path, &cwd, remote_id)
+            .join("agent-1.jsonl")
+            .exists()
+    );
+
+    // Turn completion triggers `push`.
+    let outcome = resumed
+        .prompt_run(vec![text_block("follow-up")])
+        .await
+        .expect("prompt");
+    assert!(
+        matches!(
+            outcome,
+            TurnOutcome::Finished {
+                stop_reason: Some(Open::Known(aither_acp::StopReason::EndTurn)),
+                error: None,
+                ..
+            }
+        ),
+        "expected clean EndTurn, got: {outcome:?}"
+    );
+    cli_task.await.expect("cli task");
+
+    {
+        let log = sync_events.lock().unwrap();
+        assert_eq!(log.len(), 2);
+        assert_eq!(log[0].op, "pull");
+        assert_eq!(log[0].session_id, remote_id);
+        assert_eq!(log[0].cwd, cwd);
+        assert_eq!(log[0].home, home.path);
+        assert_eq!(log[1].op, "push");
+        assert_eq!(log[1].session_id, remote_id);
+    }
+
+    // Session close triggers a final `push` on shutdown.
+    resumed.close().await.expect("close session");
+    {
+        let log = sync_events.lock().unwrap();
+        assert_eq!(log.len(), 3);
+        assert_eq!(log[2].op, "push");
+        assert_eq!(log[2].session_id, remote_id);
+    }
+
+    client.close().await;
+    tokio::time::timeout(Duration::from_secs(5), client_task)
+        .await
+        .expect("client_task exit")
+        .expect("client_task join");
+    tokio::time::timeout(Duration::from_secs(5), server_task)
+        .await
+        .expect("server_task exit")
+        .expect("server_task join");
+
+    // Closing the connection after session close must not double-push.
+    assert_eq!(sync_events.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn transcript_sync_pull_error_surfaces_and_push_error_is_nonfatal() {
+    let home = TempHome::new();
+    let recording = Recording::new();
+    let (cli_tx, cli_rx) = async_channel::unbounded();
+    let cwd = std::env::temp_dir().canonicalize().unwrap();
+    let sync_events = Arc::new(Mutex::new(Vec::new()));
+
+    let sync = MockTranscriptSync {
+        events: Arc::clone(&sync_events),
+        seed_on_pull: false,
+        fail_pull: true,
+        fail_push: true,
+    };
+
+    let config = ClaudeAcpConfig::new()
+        .transcript_home(&home.path)
+        .transcript_sync(sync)
+        .connector(move |spawn_config, control_handler| {
+            let cli_tx = cli_tx.clone();
+            async move {
+                let ((sdk_r, sdk_w), (reader, writer)) = mock_cli_pipe();
+                let _ = cli_tx
+                    .send(MockCliEndpoint {
+                        spawn_config,
+                        reader,
+                        writer,
+                    })
+                    .await;
+                Ok(ConnectedSession::attach(sdk_r, sdk_w, control_handler))
+            }
+        });
+
+    let (client_transport, server_transport) = Memory::pair();
+    let (_peer, server_conn) = serve(server_transport, config);
+    let server_task = tokio::spawn(server_conn);
+    let (client, client_conn) = recording
+        .build_client()
+        .connect(client_transport)
+        .await
+        .expect("ACP connect");
+    let client_task = tokio::spawn(client_conn);
+
+    // 1. Failing `pull` surfaces an error on `resume_session`.
+    let resume_err = client
+        .resume_session(
+            SessionId::from_string("77777777-6666-4555-8444-333333333333"),
+            &cwd,
+        )
+        .open()
+        .await
+        .unwrap_err();
+    assert!(
+        resume_err.to_string().contains("remote bucket unavailable"),
+        "expected pull error to surface, got: {resume_err}"
+    );
+
+    // 2. Failing `push` after a turn and during shutdown is logged and non-fatal.
+    let cli_task = tokio::spawn(async move {
+        let mut cli = cli_rx.recv().await.expect("cli endpoint");
+        cli.ack_initialize(vec![]).await;
+        let _user = cli.recv().await;
+        cli.send(&json!({
+            "type": "result", "subtype": "success", "is_error": false,
+            "duration_ms": 2, "duration_api_ms": 1, "num_turns": 1,
+            "session_id": "s-push-fail", "total_cost_usd": 0.0
+        }))
+        .await;
+    });
+
+    let session = client.new_session(&cwd).open().await.expect("session/new");
+    let outcome = session
+        .prompt_run(vec![text_block("push will fail")])
+        .await
+        .expect("turn must succeed even when transcript push fails");
+    assert!(matches!(
+        outcome,
+        TurnOutcome::Finished {
+            stop_reason: Some(Open::Known(aither_acp::StopReason::EndTurn)),
+            error: None,
+            ..
+        }
+    ));
+    cli_task.await.expect("cli task");
+
+    session
+        .close()
+        .await
+        .expect("close must not fail on push error");
+
+    let ops: Vec<&'static str> = sync_events.lock().unwrap().iter().map(|r| r.op).collect();
+    assert_eq!(ops, vec!["pull", "push", "push"]);
+
+    client.close().await;
+    tokio::time::timeout(Duration::from_secs(5), client_task)
+        .await
+        .expect("client_task exit")
+        .expect("client_task join");
+    tokio::time::timeout(Duration::from_secs(5), server_task)
+        .await
+        .expect("server_task exit")
+        .expect("server_task join");
 }

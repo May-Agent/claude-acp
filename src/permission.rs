@@ -145,6 +145,14 @@ impl PermissionMemory {
                             promoted_mode = Some(AcpMode::AgentFullAccess);
                             recorded_any_rule = true;
                         }
+                        Some(PermissionModeName::Unknown(mode)) if mode == "auto" => {
+                            promoted_mode = Some(AcpMode::Auto);
+                            recorded_any_rule = true;
+                        }
+                        Some(PermissionModeName::Unknown(mode)) if mode == "dontAsk" => {
+                            promoted_mode = Some(AcpMode::DontAsk);
+                            recorded_any_rule = true;
+                        }
                         _ => {}
                     }
                 }
@@ -359,8 +367,15 @@ impl ControlHandler for SessionControlHandler {
 
         {
             let current_mode = *self.mode.lock().expect("session mode mutex poisoned");
-            if current_mode == AcpMode::AgentFullAccess {
-                return Ok(PermissionDecision::allow());
+            match current_mode {
+                AcpMode::AgentFullAccess => return Ok(PermissionDecision::allow()),
+                AcpMode::DontAsk => {
+                    return Ok(PermissionDecision::deny(format!(
+                        "tool `{}` denied in dont-ask mode",
+                        req.tool_name
+                    )));
+                }
+                AcpMode::ReadOnly | AcpMode::WorkspaceWrite | AcpMode::Agent | AcpMode::Auto => {}
             }
         }
 

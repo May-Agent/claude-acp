@@ -7,7 +7,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use aither_acp::Implementation;
-use claude_acp_sdk::{AnyControlHandler, Client, ControlHandler, SpawnConfig};
+use claude_acp_sdk::{
+    AnyControlHandler, AnyTranscriptSync, Client, ControlHandler, NoopTranscriptSync, SpawnConfig,
+    TranscriptSync,
+};
 use futures_lite::io::{AsyncRead, AsyncWrite};
 use tracing::debug;
 
@@ -191,14 +194,18 @@ pub struct ClaudeAcpConfig {
     /// Base [`SpawnConfig`] template applied to newly created or resumed sessions.
     pub spawn: SpawnConfig,
     /// Optional initial ACP mode identifier (`"read-only"`, `"workspace-write"`,
-    /// `"agent"`, or `"agent-full-access"`). Defaults to `"agent"` unless
-    /// `spawn.permission_mode` specifies another mode.
+    /// `"agent"`, `"auto"`, `"dont-ask"`, or `"agent-full-access"`). Defaults
+    /// to `"agent"` unless `spawn.permission_mode` specifies another mode.
     pub default_mode: Option<String>,
     /// Whether to stream incremental token/thinking deltas (`--include-partial-messages`).
     pub include_partial_messages: bool,
     /// Optional home directory override for [`TranscriptStore`](claude_acp_sdk::TranscriptStore)
     /// (`<home>/.claude/projects`), primarily used in isolated tests.
     pub transcript_home: Option<PathBuf>,
+    /// Pluggable lifecycle hook synchronizing session transcripts (main and
+    /// `subagents/agent-*.jsonl` files) before resume/load and after turns and
+    /// shutdown. Defaults to [`NoopTranscriptSync`].
+    pub transcript_sync: AnyTranscriptSync,
     /// Maximum number of sessions returned per `session/list` page.
     pub session_list_page_size: usize,
     /// Implementation metadata advertised in `initialize`.
@@ -213,6 +220,7 @@ impl Default for ClaudeAcpConfig {
             default_mode: None,
             include_partial_messages: true,
             transcript_home: None,
+            transcript_sync: AnyTranscriptSync::new(NoopTranscriptSync),
             session_list_page_size: DEFAULT_SESSION_LIST_PAGE_SIZE,
             agent_info: Implementation {
                 name: env!("CARGO_PKG_NAME").to_string(),
@@ -249,7 +257,8 @@ impl ClaudeAcpConfig {
     }
 
     /// Set the default ACP session mode identifier (`"read-only"`,
-    /// `"workspace-write"`, `"agent"`, or `"agent-full-access"`).
+    /// `"workspace-write"`, `"agent"`, `"auto"`, `"dont-ask"`, or
+    /// `"agent-full-access"`).
     #[must_use]
     pub fn default_mode(mut self, mode: impl Into<String>) -> Self {
         self.default_mode = Some(mode.into());
@@ -268,6 +277,14 @@ impl ClaudeAcpConfig {
     #[must_use]
     pub fn transcript_home(mut self, home: impl Into<PathBuf>) -> Self {
         self.transcript_home = Some(home.into());
+        self
+    }
+
+    /// Install a custom [`TranscriptSync`] lifecycle hook for remote transcript
+    /// pull/push synchronization.
+    #[must_use]
+    pub fn transcript_sync<S: TranscriptSync>(mut self, sync: S) -> Self {
+        self.transcript_sync = AnyTranscriptSync::new(sync);
         self
     }
 

@@ -748,6 +748,106 @@ async fn session_control_methods_set_mode_model_thinking_effort_rewind_and_mcp_s
 }
 
 #[tokio::test]
+async fn context_usage_decodes_breakdown_null_fallback_and_control_error() {
+    let ((c_read, c_write), (mut cli_in, mut cli_out)) = duplex_pair();
+    let (client, driver) = Client::attach(c_read, c_write, NoopControlHandler);
+    let driver_task = tokio::spawn(driver);
+
+    let mock_cli = tokio::spawn(async move {
+        let req1 = read_json_frame(&mut cli_in).await;
+        assert_eq!(req1["type"], "control_request");
+        assert_eq!(req1["request"]["subtype"], "get_context_usage");
+        send_control_ack(
+            &mut cli_out,
+            &req1["request_id"],
+            json!({
+                "model": "claude-sonnet-4-6",
+                "totalTokens": 18420,
+                "maxTokens": 200_000,
+                "rawMaxTokens": 200_000,
+                "percentage": 9.21,
+                "isAutoCompactEnabled": true,
+                "autoCompactThreshold": 160_000,
+                "categories": [
+                    { "name": "System prompt", "tokens": 3200, "isDeferred": false },
+                    { "name": "Deferred tools", "tokens": 900, "isDeferred": true }
+                ],
+                "mcpTools": [
+                    { "name": "mcp__fs__read", "serverName": "fs", "tokens": 410, "isLoaded": true },
+                    { "name": "mcp__fs__write", "serverName": "fs", "tokens": 520, "isLoaded": false }
+                ],
+                "memoryFiles": [
+                    { "path": "CLAUDE.md", "type": "Project", "tokens": 640 }
+                ],
+                "agents": [
+                    { "agentType": "Explore", "source": "built-in", "tokens": 300 }
+                ],
+                "skills": {
+                    "totalTokens": 120,
+                    "skillFrontmatter": [
+                        { "name": "review", "source": "project", "tokens": 120 }
+                    ]
+                },
+                "futureField": "preserved"
+            }),
+        )
+        .await;
+
+        let req2 = read_json_frame(&mut cli_in).await;
+        assert_eq!(req2["request"]["subtype"], "get_context_usage");
+        send_control_ack(&mut cli_out, &req2["request_id"], Value::Null).await;
+
+        let req3 = read_json_frame(&mut cli_in).await;
+        assert_eq!(req3["request"]["subtype"], "get_context_usage");
+        cli_out
+            .send_json(&json!({
+                "type": "control_response",
+                "response": {
+                    "subtype": "error",
+                    "request_id": req3["request_id"],
+                    "error": "context usage unavailable"
+                }
+            }))
+            .await
+            .unwrap();
+    });
+
+    let usage = client.context_usage().await.unwrap();
+    assert_eq!(usage.model, "claude-sonnet-4-6");
+    assert_eq!(usage.total_tokens, 18_420);
+    assert_eq!(usage.max_tokens, 200_000);
+    assert_eq!(usage.raw_max_tokens, Some(200_000));
+    assert_eq!(usage.percentage, Some(9.21));
+    assert!(usage.is_auto_compact_enabled);
+    assert_eq!(usage.auto_compact_threshold, Some(160_000));
+    assert_eq!(usage.categories.len(), 2);
+    assert_eq!(usage.categories[1].is_deferred, Some(true));
+    assert_eq!(usage.mcp_tools.len(), 2);
+    assert_eq!(usage.mcp_tools[1].is_loaded, Some(false));
+    assert_eq!(usage.memory_files[0].path, "CLAUDE.md");
+    assert_eq!(usage.memory_files[0].file_type.as_deref(), Some("Project"));
+    assert_eq!(usage.agents[0].agent_type, "Explore");
+    let skills = usage.skills.as_ref().expect("skills breakdown");
+    assert_eq!(skills.total_tokens, Some(120));
+    assert_eq!(skills.skill_frontmatter[0].name, "review");
+    assert_eq!(usage.extra["futureField"], json!("preserved"));
+
+    let empty = client.context_usage().await.unwrap();
+    assert_eq!(empty.total_tokens, 0);
+    assert_eq!(empty.categories.len(), 0);
+
+    let err = client.context_usage().await.unwrap_err();
+    assert!(matches!(
+        err,
+        SdkError::Control { message, .. } if message == "context usage unavailable"
+    ));
+
+    mock_cli.await.unwrap();
+    client.close();
+    driver_task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn unexpected_eof_fails_all_pending_control_requests_immediately() {
     let ((c_read, c_write), (mut cli_in, mut cli_out)) = duplex_pair();
     let (client, driver) = Client::attach(c_read, c_write, NoopControlHandler);

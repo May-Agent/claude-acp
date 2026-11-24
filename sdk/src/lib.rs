@@ -42,20 +42,23 @@ pub use claude_codes::{
     ImageSourceType, InitMessage, InitializeRequest, McpMessageRequest, MediaType, Permission,
     PermissionBehavior, PermissionDestination, PermissionModeName, PermissionResult,
     PermissionRule, PermissionSuggestion, PermissionType, PromptSuggestionMessage, RateLimitEvent,
-    StreamEventMessage, SystemMessage, SystemSubtype, TextBlock, ThinkingBlock, ToolInput,
-    ToolPermissionRequest, ToolProgressMessage, ToolResultBlock, ToolResultContent, ToolUseBlock,
-    ToolUseSummaryMessage,
+    RateLimitInfo, RateLimitStatus, RateLimitWindow, StreamEventMessage, SystemMessage,
+    SystemSubtype, TextBlock, ThinkingBlock, ToolInput, ToolPermissionRequest, ToolProgressMessage,
+    ToolResultBlock, ToolResultContent, ToolUseBlock, ToolUseSummaryMessage,
 };
 
 pub use client::{
-    Client, InitializeResponse, McpServerStatus, McpStatusResponse, RewindFilesRequest,
-    RewindFilesResponse, SessionEvent, StreamDelta,
+    Client, ContextUsageAgent, ContextUsageCategory, ContextUsageMcpTool, ContextUsageMemoryFile,
+    ContextUsageResponse, ContextUsageSkill, ContextUsageSkills, InitializeResponse,
+    McpServerStatus, McpStatusResponse, RewindFilesRequest, RewindFilesResponse, SessionEvent,
+    StreamDelta,
 };
 pub use config::{PermissionMode, SessionConfig, SpawnConfig};
 pub use error::{Result, SdkError};
 pub use handler::{AnyControlHandler, ControlHandler, NoopControlHandler, PermissionDecision};
 pub use transcript::{
-    SessionSummary, TranscriptEntry, TranscriptRecord, TranscriptStore, delete_transcript,
-    encode_project_dir, find_transcript_path, list_sessions, load_transcript, transcript_path,
+    AnyTranscriptSync, NoopTranscriptSync, SessionSummary, TranscriptEntry, TranscriptRecord,
+    TranscriptStore, TranscriptSync, delete_transcript, encode_project_dir, find_transcript_path,
+    list_sessions, load_transcript, subagents_dir, transcript_path,
 };
 pub use transport::{NdjsonReader, NdjsonTransport, NdjsonWriter};
